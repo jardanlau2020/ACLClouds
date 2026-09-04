@@ -30,13 +30,6 @@ jobs:
           pip install -r requirements.txt
           seleniumbase install chromedriver || true
 
-      - name: 设置代理 (sing-box, 供浏览器过 Turnstile)
-        continue-on-error: true
-        env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-        run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-
       - name: 执行续期
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
@@ -44,7 +37,8 @@ jobs:
           ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          IS_PROXY: "true"
+          IS_PROXY: "false"
+          GH_REPO: ${{ secrets.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
