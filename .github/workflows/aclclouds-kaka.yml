@@ -33,6 +33,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb fonts-noto-cjk
           pip install -r requirements.txt
+          # Playwright：保留作浏览器自动化备用；当前主流程仍用 SeleniumBase。
+          pip install playwright
+          python -m playwright install chromium
           seleniumbase install chromedriver || true
 
       - name: 执行续期
