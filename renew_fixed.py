@@ -28,7 +28,7 @@ import json
 import time
 import re
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -63,7 +63,8 @@ IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "socks5://127.0.0.1:1080"
 HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()          # 自动更新 ACL_COOKIES Secret
-GH_REPO = os.environ.get("GH_REPO", "weikkadd/ACLClouds-server").strip()
+# 不设 GH_REPO 就禁止自动回写 Cookie，避免误写上游仓库。
+GH_REPO = os.environ.get("GH_REPO", "").strip()
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -976,13 +977,21 @@ def process_account(label, cookie_str):
                     _, new_expire_str = find_expire({}, new_detail)
                     new_expire = parse_iso(new_expire_str) if new_expire_str else None
                     if new_expire:
-                        new_remaining = (new_expire - now).total_seconds()
-                        results.append(f"✅ {srv['name']}: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
-                        log(f"✅ 续期成功: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
+                        # 只接受到期时间实际向后移动；HTTP 2xx 本身不等于续期成功。
+                        old_expire = now + timedelta(seconds=srv['remaining'])
+                        if new_expire <= old_expire:
+                            results.append(f"❌ {srv['name']}: 返回 2xx 但 expires_at 没有增加")
+                            log(f"❌ 续期未确认: expires_at 未增加 ({new_expire.isoformat()})")
+                            failed += 1
+                        else:
+                            new_remaining = (new_expire - now).total_seconds()
+                            results.append(f"✅ {srv['name']}: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
+                            log(f"✅ 续期成功: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
+                            renewed += 1
                     else:
-                        results.append(f"✅ {srv['name']}: 续期成功")
-                        log(f"✅ 续期成功")
-                    renewed += 1
+                        results.append(f"❌ {srv['name']}: 2xx 但无法读取续期后的 expires_at")
+                        log("❌ 续期未确认: 2xx 但详情无 expires_at")
+                        failed += 1
             else:
                 body = r.text[:200]
                 err = renew_error_msg(r)

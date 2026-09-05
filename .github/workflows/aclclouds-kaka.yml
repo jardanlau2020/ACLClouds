@@ -2,12 +2,17 @@ name: AclClouds-卡卡自动续期
 
 on:
   schedule:
-    # 每天 UTC 01:00（北京时间 09:00）
-    - cron: "0 1 * * *"
+    # 每 6 小时检查一次（GitHub Actions 可能延迟，但比每日一次更抗漏跑）
+    - cron: "0 */6 * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: read
+
+# 防止上一次续期未完成时并发触发，避免重复 Renew。
+concurrency:
+  group: aclclouds-renew
+  cancel-in-progress: false
 
 jobs:
   renew:
