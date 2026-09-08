@@ -815,238 +815,6 @@ def update_acl_secret(cookie_str):
         return False
 
 
-# ==================== 浏览器续期 fallback (API 被 Turnstile 拦截时使用) ====================
-# 纯 API 的 renew POST 在数据中心 IP 上会被 Cloudflare 风控要求 Turnstile 人机验证 (403 + captcha_required)。
-# 此时切真实浏览器 (undetected-chrome + xvfb, 同 katabump/icehost 过 CF 盾套路):
-# 注入账号 Cookie → 开面板 → 找服务器页 → 点续期按钮 → 过 Turnstile → API 验证 expires_at 是否后移。
-
-_DROP_COOKIE_NAMES = {"cf_clearance", "__cf_bm", "cf_obfuscate"}  # IP/UA 绑定, 旧值反而触发风控
-
-
-def _cookie_list(cookie_str):
-    """把 Cookie 字符串解析为 selenium add_cookie 字典列表 (丢掉 IP 绑定型)"""
-    out = []
-    for part in cookie_str.split(";"):
-        part = part.strip()
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if k in _DROP_COOKIE_NAMES:
-            continue
-        d = {"name": k, "value": v, "domain": "aclclouds.com", "path": "/"}
-        if k.startswith("__Host-") or k.startswith("cf-"):
-            d["secure"] = True
-        out.append(d)
-    return out
-
-
-def _pass_cf_challenge(sb, timeout=90):
-    """等待 Cloudflare 挑战/拦截页消除 (出现 Turnstile 复选框则点击)"""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            url = sb.get_current_url().lower()
-        except Exception:
-            url = ""
-        src = ""
-        try:
-            src = sb.get_page_source().lower()
-        except Exception:
-            pass
-        if "cdn-cgi/challenge" not in url and not any(k in src for k in ("just a moment", "cf-chl", "challenge-platform")):
-            return True
-        if _click_turnstile(sb):
-            log("   点击挑战页 Turnstile 复选框, 等待自动通过...")
-        sb.sleep(3)
-    return False
-
-
-def renew_via_browser(srv, cookie_str, session, old_remaining):
-    """浏览器 fallback 续期。成功返回新剩余秒数, 失败返回 None (日志带细节)。
-
-    步骤: 注入 Cookie → 首页过 CF 挑战 → 打开 /servers/{短id} (Pterodactyl 路由, 失败则列表按名找)
-          → 点续期按钮 (支持中/英/法 UI) → 确认框 → Turnstile → API 验证 expires_at 后移。
-    """
-    try:
-        from seleniumbase import SB
-    except ImportError:
-        log("❌ 浏览器 fallback 失败: 未安装 seleniumbase")
-        return None
-
-    kwargs = {"uc": True, "headless": HEADLESS}
-    if IS_PROXY:
-        kwargs["proxy"] = PROXY_SERVER
-        log(f"🔗 浏览器 fallback 走代理: {PROXY_SERVER}")
-
-    cks = _cookie_list(cookie_str)
-    log(f"🌐 浏览器 fallback: 启动 undetected-chrome, 注入 {len(cks)} 个 cookie")
-
-    renew_kw = ("renew", "extension", "extend", "add time",
-                "renouveler", "renouvel", "prolonger", "prolongation",
-                "续期", "续费", "延期")
-    skip_kw = ("auto renew", "autorenew", "auto-renew", "auto-renouvel", "renewal status")
-    confirm_kw = ("confirm", "ok", "yes", "确认", "确定", "oui")
-
-    try:
-        with SB(**kwargs) as sb:
-            driver = sb.driver
-            # 1) 先落地建域上下文, 再清旧 cookie 注入账号 cookie
-            sb.open(BASE_URL + "/")
-            try:
-                driver.delete_all_cookies()
-            except Exception:
-                pass
-            for c in cks:
-                try:
-                    driver.add_cookie(c)
-                except Exception as e:
-                    log(f"   ⚠️ 注入 cookie {c['name']} 失败: {e}")
-            # 2) 重载首页, 过 CF 挑战
-            sb.open(BASE_URL + "/")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(2)
-            if not _pass_cf_challenge(sb):
-                log("❌ 浏览器 fallback 失败: Cloudflare 挑战 90s 未通过")
-                try:
-                    sb.save_screenshot("acl_browser_challenge.png")
-                except Exception:
-                    pass
-                return None
-            # 3) 打开服务器页: 先直连 Pterodactyl 路由 /servers/{短id}
-            page_ok = False
-            try:
-                sb.open(f"{BASE_URL}/servers/{srv['id']}")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(3)
-                body_txt = sb.get_text("body").lower()
-                page_ok = srv["name"].lower() in body_txt or f"/servers/{srv['id']}" in sb.get_current_url()
-            except Exception as e:
-                log(f"   直连服务器页异常: {e}")
-            if not page_ok:
-                log(f"   /servers/{srv['id']} 未达服务器页, 改从服务器列表按名称找...")
-                try:
-                    sb.open(f"{BASE_URL}/servers")
-                    sb.wait_for_ready_state_complete()
-                    sb.sleep(3)
-                    for a in driver.find_elements("css selector", "a"):
-                        try:
-                            if srv["name"].lower() in (a.text or "").lower():
-                                a.click()
-                                sb.sleep(3)
-                                page_ok = True
-                                break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
-            if not page_ok:
-                log(f"❌ 浏览器 fallback 失败: 找不到服务器 {srv['name']} 的页面")
-                try:
-                    sb.save_screenshot("acl_browser_notfound.png")
-                except Exception:
-                    pass
-                return None
-            # 4) 找续期按钮并点击 (中/英/法 UI; 排除 auto-renew 开关)
-            clicked = False
-            try:
-                for el in driver.find_elements("css selector", "button, a, [role='button']"):
-                    try:
-                        if not el.is_displayed():
-                            continue
-                        txt = (el.text or "").strip()
-                        if not txt:
-                            continue
-                        t = txt.lower()
-                        if any(k in t for k in renew_kw) and not any(k in t for k in skip_kw):
-                            log(f"   找到续期按钮: '{txt[:40]}'")
-                            el.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        continue
-            except Exception as e:
-                log(f"   枚举按钮异常: {e}")
-            if not clicked:
-                log("❌ 浏览器 fallback 失败: 服务器页未找到续期按钮 (面板 UI 可能变了)")
-                try:
-                    sb.save_screenshot("acl_browser_norenewbtn.png")
-                    names = []
-                    for b in driver.find_elements("css selector", "button, a"):
-                        try:
-                            if b.is_displayed() and (b.text or "").strip():
-                                names.append(b.text.strip()[:30])
-                        except Exception:
-                            continue
-                    log(f"   页面可见按钮: {names[:30]}")
-                except Exception:
-                    pass
-                return None
-            sb.sleep(2)
-            # 5) 确认对话框
-            try:
-                for el in driver.find_elements("css selector", "button, [role='button'], .btn"):
-                    try:
-                        if not el.is_displayed():
-                            continue
-                        t = (el.text or "").strip().lower()
-                        if any(k in t for k in confirm_kw):
-                            el.click()
-                            log(f"   点击确认: '{t[:30]}'")
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            sb.sleep(2)
-            # 6) 续期动作可能再弹 Turnstile, 点击直到 token 生成
-            for i in range(1, 6):
-                token_ok = False
-                try:
-                    driver.switch_to.default_content()
-                    tok = driver.execute_script(
-                        "var el=document.querySelector('textarea[name=\"cf-turnstile-response\"],"
-                        "input[name=\"cf-turnstile-response\"]');"
-                        "return !!(el&&el.value&&el.value.length>10);")
-                    token_ok = bool(tok)
-                except Exception:
-                    pass
-                if token_ok:
-                    log("   Turnstile token 已生成")
-                    break
-                if _click_turnstile(sb):
-                    log(f"   第 {i} 次点击续期动作 Turnstile...")
-                else:
-                    break
-                sb.sleep(3)
-            sb.sleep(4)
-            try:
-                sb.save_screenshot("acl_browser_renew_clicked.png")
-            except Exception:
-                pass
-    except Exception as e:
-        log(f"❌ 浏览器 fallback 异常: {e}")
-        return None
-
-    # 7) API 验证 expires_at 是否后移 (后端生效可能有延迟, 重试 3 轮)
-    time.sleep(3)
-    for _ in range(3):
-        try:
-            detail = server_detail(session, srv["id"])
-            _, new_str = find_expire({}, detail)
-            new_exp = parse_iso(new_str) if new_str else None
-            if new_exp:
-                new_rem = (new_exp - datetime.now(timezone.utc)).total_seconds()
-                if new_rem > old_remaining + 60:
-                    log(f"✅ 浏览器 fallback 续期成功: {fmt_remaining(old_remaining)} → {fmt_remaining(new_rem)}")
-                    return int(new_rem)
-        except Exception:
-            pass
-        time.sleep(5)
-    log("❌ 浏览器 fallback: 按钮已点击但 expires_at 未后移 (动作未真正发出或后端未生效)")
-    return None
-
-
 # ==================== 单账号续期流程 ====================
 def process_account(label, cookie_str):
     log(f"\n{'='*60}")
@@ -1193,17 +961,9 @@ def process_account(label, cookie_str):
                 failed += 1
                 break
             elif r.status_code == 403 and captcha:
-                log(f"🛡️ API 续期被 Cloudflare 风控拦截 (需要 Turnstile), 切浏览器 fallback...")
-                new_rem = renew_via_browser(srv, cookie_str, session, srv["remaining"])
-                if new_rem is not None:
-                    results.append(f"✅ {srv['name']}: API 被 Turnstile 拦截, 浏览器 fallback 续期成功 "
-                                   f"({fmt_remaining(srv['remaining'])} → {fmt_remaining(new_rem)})")
-                    log(f"✅ {srv['name']}: 浏览器 fallback 续期成功")
-                    renewed += 1
-                else:
-                    results.append(f"❌ {srv['name']}: 被 Turnstile 拦截, 浏览器 fallback 亦失败")
-                    log(f"❌ {srv['name']}: 浏览器 fallback 失败")
-                    failed += 1
+                log(f"🛡️ 需要 Turnstile 验证 (纯 API 无法通过, 跳过)")
+                results.append(f"🛡️ {srv['name']}: 需要 Turnstile 验证")
+                failed += 1
             elif r.status_code in (200, 201, 202, 204):
                 # 2xx 也可能 body 带错误 (如 renewNotAvailableYet)
                 err = renew_error_msg(r)
@@ -1291,9 +1051,9 @@ def build_summary(all_results):
             lines.append(f"👤 {r['label']}: ❌ {r.get('msg', '失败')}")
         else:
             lines.append(f"👤 {r['label']}: ✅ {r.get('msg', '成功')}")
-        if r.get("results"):
-            for res in r["results"]:
-                lines.append(f"  {res}")
+            if r.get("results"):
+                for res in r["results"]:
+                    lines.append(f"  {res}")
         lines.append("")
 
     return "\n".join(lines)
@@ -1363,9 +1123,6 @@ def main():
     summary = build_summary(all_results)
     print("\n" + summary + "\n")
     send_tg(summary)
-    if any(not r.get("ok", False) for r in all_results):
-        log("❌ 存在续期失败, exit 1 (Actions 将标红)")
-        sys.exit(1)
 
 
 if __name__ == "__main__":
