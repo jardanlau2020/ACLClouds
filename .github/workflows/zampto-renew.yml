@@ -133,12 +133,25 @@ jobs:
                       out["uuid"] = password
               else:  # hysteria2 / hy2
                   out["password"] = password
-              out["tls"] = {"enabled": True, "server_name": sni or server, "insecure": insecure}
+              sec = params.get("security", [""])[0]
+              out["tls"] = {"enabled": sec != "none", "server_name": sni or server, "insecure": insecure}
+              fp = params.get("fp", [""])[0]
+              if fp:
+                  out["tls"]["utls"] = {"enabled": True, "fingerprint": fp}
               if alpn:
                   out["tls"]["alpn"] = [alpn]
+              if sec == "reality":
+                  out["tls"]["reality"] = {"public_key": params.get("pbk", [""])[0], "short_id": params.get("sid", [""])[0]}
+                  spx = params.get("spx", [""])[0]
+                  if spx:
+                      out["tls"]["reality"]["spiderX"] = spx
               if proto == "tuic":
                   out["udp_relay_mode"] = "native"
                   out["congestion_control"] = "bbr"
+              elif proto == "vless":
+                  flow = params.get("flow", [""])[0]
+                  if flow:
+                      out["flow"] = flow
               elif proto == "hysteria2":
                   out["up_mbps"] = 100
                   out["down_mbps"] = 100
@@ -163,10 +176,11 @@ jobs:
           SB_VERSION="1.10.7"
           SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
           echo "  URL: $SB_URL"
-          curl -fSL "$SB_URL" -o /tmp/sb.tar.gz
+          curl -fSL "$SB_URL" -o /tmp/sb.tar.gz || { echo "[ERROR] 下載 sing-box 失敗"; exit 1; }
           tar -xzf /tmp/sb.tar.gz -C /tmp/
           mv /tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box /tmp/sing-box
           chmod +x /tmp/sing-box
+          [ -x /tmp/sing-box ] || { echo "[ERROR] sing-box 二進制缺失"; exit 1; }
 
           # Verify it's actually an ELF binary
           FILE_TYPE=$(file /tmp/sing-box 2>/dev/null || echo "unknown")
