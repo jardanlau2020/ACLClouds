@@ -197,6 +197,10 @@ def build_api_session(cookie_str):
         "Referer": f"{BASE_URL}/dashboard",
     })
     s._raw_cookie = sanitize_cookie(cookie_str)
+    if IS_PROXY and PROXY_SERVER:
+        s.proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+        s.trust_env = False
+        log(f"🔗 API session 走代理: {PROXY_SERVER.split('@')[-1]} (隐藏凭证)")
     return s
 
 

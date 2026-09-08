@@ -42,7 +42,8 @@ jobs:
           ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          IS_PROXY: "false"
+          IS_PROXY: ${{ secrets.IS_PROXY }}
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
           GH_REPO: ${{ secrets.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
