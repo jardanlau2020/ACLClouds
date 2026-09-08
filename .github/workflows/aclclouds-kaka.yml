@@ -36,11 +36,14 @@ jobs:
           seleniumbase install chromedriver || true
 
       - name: 啟動本地 TUIC 代理橋 (sing-box)
-        if: ${{ secrets.TUIC_PROXY != '' }}
         env:
           TUIC_PROXY: ${{ secrets.TUIC_PROXY }}
         run: |
           set -e
+          if [ -z "$TUIC_PROXY" ]; then
+            echo "⚠️ 未設 TUIC_PROXY secret, 跳過代理橋 (續期將直連出街, 可能被 Cloudflare 擋)"
+            exit 0
+          fi
           cd /tmp
           curl -sL -o sb.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz
           tar xzf sb.tar.gz
@@ -75,14 +78,18 @@ jobs:
           ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          IS_PROXY: ${{ (secrets.TUIC_PROXY != '' && 'true') || secrets.IS_PROXY }}
-          PROXY_SERVER: ${{ (secrets.TUIC_PROXY != '' && 'http://127.0.0.1:10800') || secrets.PROXY_SERVER }}
+          TUIC_PROXY: ${{ secrets.TUIC_PROXY }}
           GH_REPO: ${{ secrets.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         # xvfb-run 提供虚拟显示器, uc_gui_click_captcha 的 GUI 点击才能工作
-        run: xvfb-run --auto-servernum python renew_fixed.py
+        run: |
+          # TUIC 橋在位 -> 全鏈路走 10800 橋 (HTTP+SOCKS)
+          if [ -n "$TUIC_PROXY" ]; then
+            export IS_PROXY=true PROXY_SERVER=http://127.0.0.1:10800
+          fi
+          xvfb-run --auto-servernum python renew_fixed.py
 
       - name: 📸 上传调试截图 (如有)
         if: always()
