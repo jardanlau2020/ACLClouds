@@ -1051,9 +1051,9 @@ def build_summary(all_results):
             lines.append(f"👤 {r['label']}: ❌ {r.get('msg', '失败')}")
         else:
             lines.append(f"👤 {r['label']}: ✅ {r.get('msg', '成功')}")
-            if r.get("results"):
-                for res in r["results"]:
-                    lines.append(f"  {res}")
+        if r.get("results"):
+            for res in r["results"]:
+                lines.append(f"  {res}")
         lines.append("")
 
     return "\n".join(lines)
@@ -1123,6 +1123,9 @@ def main():
     summary = build_summary(all_results)
     print("\n" + summary + "\n")
     send_tg(summary)
+    if any(not r.get("ok", False) for r in all_results):
+        log("❌ 存在续期失败, exit 1 (Actions 将标红)")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
