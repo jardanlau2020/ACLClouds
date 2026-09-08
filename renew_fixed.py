@@ -486,54 +486,62 @@ def _challenge_card(sb):
     try:
         clicked = sb.driver.execute_script("""
             var t = arguments[0].toLowerCase();
-            // 1) 找 "Click on X" 指令的最内层元素作为锚点
-            var all = document.querySelectorAll('div, span, p, label, b, strong, a');
+            var known = ['vps', 'minecraft', 'discord', 'cloud'];
+            // 1) 找最内层 "Click on" 锚点元素
+            var all = document.querySelectorAll('*');
             var cands = [];
             for (var el of all) {
                 var txt = (el.textContent || '').trim().toLowerCase();
                 if (txt.indexOf('click on') === 0 && txt.length < 40) cands.push(el);
             }
-            if (!cands.length) return false;
+            if (!cands.length) return 'no-anchor';
             cands.sort(function(a,b){ return a.querySelectorAll('*').length - b.querySelectorAll('*').length; });
             var anchor = cands[0];
-            // 2) 从锚点向上找包含目标词卡片的容器; 选面积最小的可见匹配 (卡片本身而非容器)
-            var box = anchor;
-            for (var i = 0; i < 12 && box; i++) {
-                box = box.parentElement;
-                if (!box) break;
-                var cands2 = box.querySelectorAll('div, button, a, span, p, label');
-                var matches = [];
-                for (var c of cands2) {
-                    var ct = (c.textContent || '').trim().toLowerCase();
-                    if (ct === t) {
-                        var r0 = c.getBoundingClientRect();
-                        if (r0.width > 0 && r0.height > 0) matches.push({el: c, area: r0.width * r0.height});
-                    }
+            // 2) 找挑战盒: 最浅一层包含 >=3 个已知卡片的祖先 (排除登录表里的 OAuth 按钮干扰)
+            function cardCount(box) {
+                var n = 0;
+                var nodes = box.querySelectorAll('div, button, a, span, p, label');
+                for (var c of nodes) {
+                    if (known.indexOf((c.textContent || '').trim().toLowerCase()) !== -1) n++;
                 }
-                if (matches.length > 0) {
-                    matches.sort(function(a,b){ return a.area - b.area; });
-                    var el = matches[0].el;
-                    var r = el.getBoundingClientRect();
-                    var x = r.left + r.width / 2, y = r.top + r.height / 2;
-                    var opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0};
-                    try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch(e){}
-                    try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch(e){}
-                    try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch(e){}
-                    try { el.dispatchEvent(new MouseEvent('mouseup', opts)); } catch(e){}
-                    el.click();
-                    return true;
+                return n;
+            }
+            var box = null, p = anchor.parentElement;
+            for (var i = 0; i < 10 && p; i++) {
+                if (cardCount(p) >= 3) { box = p; break; }
+                p = p.parentElement;
+            }
+            if (!box) return 'no-box';
+            // 3) 挑战盒内: 点目标词 (选最小可见元素, 事件序列保证冒泡)
+            var matches = [];
+            var nodes = box.querySelectorAll('div, button, a, span, p, label');
+            for (var c of nodes) {
+                if ((c.textContent || '').trim().toLowerCase() === t) {
+                    var r0 = c.getBoundingClientRect();
+                    if (r0.width > 5 && r0.height > 5) matches.push({el: c, area: r0.width * r0.height});
                 }
             }
-            return false;
+            if (!matches.length) return 'no-card';
+            matches.sort(function(a,b){ return a.area - b.area; });
+            var el = matches[0].el;
+            var r = el.getBoundingClientRect();
+            var x = r.left + r.width / 2, y = r.top + r.height / 2;
+            var opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0};
+            try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch(e){}
+            try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch(e){}
+            try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch(e){}
+            try { el.dispatchEvent(new MouseEvent('mouseup', opts)); } catch(e){}
+            el.click();
+            return true;
         """, target)
     except Exception:
         clicked = False
-    if not clicked:
-        log(f"   ⚠️ '{target}' 卡片未点中, dump widget 结构排查...")
-        _dump_captcha_widget(sb)
-    else:
-        log(f"   ✅ 已点击 '{target}' 卡片")
-    return clicked
+    if clicked is True:
+        log(f"   ✅ 已点击 '{target}' 卡片 (挑战盒内)")
+        return True
+    log(f"   ⚠️ '{target}' 卡片未点中 (原因: {clicked}), dump widget 结构排查...")
+    _dump_captcha_widget(sb)
+    return False
 
 
 def _discord_oauth_login(sb):
@@ -784,10 +792,21 @@ def _browser_do_login(sb):
                     sb.enter()
                 except Exception:
                     pass
-            # 等待跳转离开登录页
+            # 等待跳转离开登录页 (被弹去外部站点 = OAuth 未完成, 视为失败)
             for _ in range(40):
                 url = sb.get_current_url()
-                if "auth/login" not in url and "login" not in url.lower():
+                host = urllib.parse.urlparse(url).netloc.lower()
+                if host and not host.endswith("aclclouds.com"):
+                    log(f"⚠️ 浏览器被重定向到外部站点 {host} (误点 OAuth 按钮?), 视为登录失败")
+                    return False
+                url_clear = "auth/login" not in url and "login" not in url.lower()
+                # 佐证: 密码输入框还在 = 仍在登录页 (防 URL 不变但 body 已切换的 SPA 情形)
+                pwd_present = False
+                try:
+                    pwd_present = bool(sb.driver.find_elements("css selector", 'input[name="password"]'))
+                except Exception:
+                    pwd_present = None  # 探测失败不阻塞
+                if url_clear and not pwd_present:
                     log(f"✅ 登录成功, 当前页面: {url}")
                     return True
                 sb.sleep(1)
@@ -806,7 +825,19 @@ def _browser_do_login(sb):
                 sb.sleep(4)
                 continue
             break
-        log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
+        log("❌ 登录后未跳转 (可能 2FA / 凭证错 / 验证码未提交)")
+        try:
+            err = sb.driver.execute_script(
+                "var els=document.querySelectorAll('.alert, [role=alert], .text-danger, .error');"
+                "return Array.from(els).map(e=>e.textContent.trim()).filter(t=>t).join(' | ').slice(0,300);")
+            if err:
+                log("   🚨 页面错误提示: " + err)
+        except Exception:
+            pass
+        try:
+            log("   🔗 当前 URL: " + sb.get_current_url())
+        except Exception:
+            pass
         try:
             print("   📝 页面内容:", sb.get_text("body")[:300])
         except Exception:
@@ -828,14 +859,16 @@ def _browser_do_login(sb):
             return True
         return "i am not a robot" in pg
 
+    dumped = False
     solved = False
     for attempt in range(1, 6):
         if not _challenge_pending():
             solved = True
             log("✅ 页面无待解人机验证")
             break
-        if attempt == 1:
+        if not dumped:
             _dump_captcha_widget(sb)
+            dumped = True
         # 2a) 先点复选框 (激活挑战可能需要这一步)
         try:
             sb.driver.switch_to.default_content()
