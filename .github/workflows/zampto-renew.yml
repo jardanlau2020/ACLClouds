@@ -1,0 +1,268 @@
+name: Zampto 自动续期 (ACLClouds 仓)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天 UTC 00:00 (北京时间 08:00)
+  workflow_dispatch:
+    inputs:
+      force_renew:
+        description: 'Force renewal regardless of expiry'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      enable_recording:
+        description: 'Enable screen recording'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+# 防止上一次续期未完成时并发触发
+concurrency:
+  group: zampto-renew
+  cancel-in-progress: false
+
+jobs:
+  zampto-auto:
+    name: 检查并自动续期
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DISPLAY: ":99"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      GALLIUM_DRIVER: "llvmpipe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🐍 配置 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 📦 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb ffmpeg curl unzip \
+            fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 libasound2t64
+
+      - name: 📦 安装 Python 依赖
+        run: |
+          pip install -r requirements-zampto.txt
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()"
+
+      - name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          set -e
+
+          export NODE_LINK
+          if [ -z "$NODE_LINK" ]; then
+            echo "[ERROR] 代理节点未配置! GitHub 裸 IP 会被 Cloudflare 风控(403), 续期必失败"
+            echo "请到 Settings -> Secrets 添加 NODE_LINK, 支持格式:"
+            echo "  hysteria2://password@host:port?sni=...&insecure=1"
+            echo "  hy2://password@host:port?..."
+            echo "  tuic://uuid:password@host:port?..."
+            echo "  vless://uuid@host:port?..."
+            exit 1
+          fi
+
+          echo "[1/4] 解析节点链接并生成 sing-box 配置 ..."
+          python3 << 'PYEOF'
+          import urllib.parse, json, os, sys, base64
+
+          link = os.environ.get("NODE_LINK", "").strip()
+          if not link:
+              sys.exit(1)
+
+          proto = "hysteria2"
+          for prefix in ["hysteria2://", "hy2://", "tuic://", "vless://", "vmess://"]:
+              if link.startswith(prefix):
+                  link = link[len(prefix):]
+                  proto = {"tuic://": "tuic", "vless://": "vless", "vmess://": "vmess"}.get(prefix, "hysteria2")
+                  break
+          link = link.split("#", 1)[0]
+          if "?" in link:
+              main, query = link.split("?", 1)
+          else:
+              main, query = link, ""
+          params = urllib.parse.parse_qs(query)
+          sni = params.get("sni", [""])[0]
+          insecure = any(params.get(k, ["0"])[0] in ("1", "true", "yes")
+                         for k in ("insecure", "allowInsecure", "allow_insecure"))
+          alpn = params.get("alpn", [""])[0]
+
+          out = {"type": proto, "tag": "proxy-out"}
+          if proto == "vmess":
+              b64 = main + "=" * ((4 - len(main) % 4) % 4)
+              vm = json.loads(base64.b64decode(b64).decode("utf-8", "ignore"))
+              out["server"] = vm.get("add", "")
+              out["server_port"] = int(vm.get("port", 0))
+              out["uuid"] = vm.get("id", "")
+              out["alter_id"] = int(vm.get("aid", "0"))
+              out["security"] = vm.get("scy", "auto") or "auto"
+              out["tls"] = {"enabled": False, "server_name": sni or vm.get("host", ""), "insecure": insecure}
+              if vm.get("tls") == "tls" or vm.get("sni") or vm.get("host"):
+                  out["tls"]["enabled"] = True
+                  out["tls"]["server_name"] = sni or vm.get("sni") or vm.get("host") or out["server"]
+          else:
+              password_raw, server_part = main.rsplit("@", 1)
+              password = urllib.parse.unquote(password_raw)
+              server, port_str = server_part.rsplit(":", 1)
+              out["server"] = server
+              out["server_port"] = int(port_str)
+              if proto == "tuic" or proto == "vless":
+                  # userinfo = uuid 或 uuid:password
+                  if ":" in password:
+                      out["uuid"], out["password"] = password.split(":", 1)
+                  else:
+                      out["uuid"] = password
+              else:  # hysteria2 / hy2
+                  out["password"] = password
+              out["tls"] = {"enabled": True, "server_name": sni or server, "insecure": insecure}
+              if alpn:
+                  out["tls"]["alpn"] = [alpn]
+              if proto == "tuic":
+                  out["udp_relay_mode"] = "native"
+                  out["congestion_control"] = "bbr"
+              elif proto == "hysteria2":
+                  out["up_mbps"] = 100
+                  out["down_mbps"] = 100
+
+          cfg = {
+              "log": {"level": "info", "timestamp": True},
+              "inbounds": [{"type": "socks", "tag": "socks-in",
+                            "listen": "127.0.0.1", "listen_port": 1080}],
+              "outbounds": [out],
+          }
+          with open("/tmp/sb_config.json", "w", encoding="utf-8") as f:
+              json.dump(cfg, f, indent=2, ensure_ascii=False)
+          print("Protocol:", proto)
+          print("Server:", out.get("server", "?"), ":", out.get("server_port", "?"))
+          print("SNI:", out.get("tls", {}).get("server_name", ""))
+          print("Insecure:", insecure)
+          PYEOF
+          echo "--- 生成的配置 ---"
+          cat /tmp/sb_config.json
+
+          echo "[2/4] Downloading sing-box ..."
+          SB_VERSION="1.10.7"
+          SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          echo "  URL: $SB_URL"
+          curl -fSL "$SB_URL" -o /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp/
+          mv /tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box /tmp/sing-box
+          chmod +x /tmp/sing-box
+
+          # Verify it's actually an ELF binary
+          FILE_TYPE=$(file /tmp/sing-box 2>/dev/null || echo "unknown")
+          echo "  File type: $FILE_TYPE"
+          if ! echo "$FILE_TYPE" | grep -q "ELF"; then
+            echo "[ERROR] sing-box binary is not valid ELF"
+            exit 1
+          fi
+          /tmp/sing-box version
+
+          # Validate config before running
+          echo "--- Validating config ---"
+          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[ERROR] sing-box config validation failed"; cat /tmp/sb_config.json; exit 1; }
+
+          echo "[3/4] Starting sing-box ..."
+          nohup /tmp/sing-box run -c /tmp/sb_config.json > /tmp/tuic.log 2>&1 &
+          SB_PID=$!
+          echo "SB_PID=$SB_PID"
+          sleep 8
+
+          echo "--- sing-box log ---"
+          cat /tmp/tuic.log || true
+          echo "--------------------"
+
+          echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
+          echo "Proxy IP:  $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
+
+          # 代理必须可用: 没有代理 -> GitHub 裸 IP 会被 Cloudflare 风控(403), 续期必失败
+          if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://www.google.com -o /dev/null; then
+            echo "PROXY_OK=1" >> $GITHUB_ENV
+            echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
+            echo "[OK] Proxy is ready"
+          else
+            echo "[ERROR] Proxy is DOWN - cannot renew (GitHub IP blocked by Cloudflare)"
+            echo "---- sing-box log ----"
+            cat /tmp/tuic.log 2>/dev/null | tail -30 || echo "no log"
+            echo "----------------------"
+            exit 1
+          fi
+
+      - name: 🔄 运行续期脚本
+        env:
+          ZAMPTO_USERNAME: ${{ secrets.ZAMPTO_USERNAME }}
+          ZAMPTO_PASSWORD: ${{ secrets.ZAMPTO_PASSWORD }}
+          ZAMPTO_SERVER_ID: ${{ secrets.ZAMPTO_SERVER_ID }}
+          ZAMPTO_SESSION_SECRET: ${{ secrets.ZAMPTO_SESSION_SECRET }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          FORCE_RENEW: ${{ github.event.inputs.force_renew || 'false' }}
+          ENABLE_RECORDING: ${{ github.event.inputs.enable_recording || 'false' }}
+        run: |
+          Xvfb :99 -screen 0 1280x720x24 +extension RANDR &
+          XVFB_PID=$!
+          sleep 2
+
+          RECORD_PID=""
+          if [ "$ENABLE_RECORDING" = "true" ]; then
+            echo "Recording enabled"
+            ffmpeg -f x11grab -video_size 1280x720 -framerate 10 -i :99 \
+              -codec:v libx264 -preset ultrafast -crf 30 \
+              -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
+              > /tmp/ffmpeg.log 2>&1 &
+            RECORD_PID=$!
+            sleep 2
+          fi
+
+          python zampto_auto.py
+          PYTHON_EXIT=$?
+
+          sleep 2
+          [ -n "$RECORD_PID" ] && kill $RECORD_PID 2>/dev/null
+          [ -n "$RECORD_PID" ] && wait $RECORD_PID 2>/dev/null
+          kill $XVFB_PID 2>/dev/null
+
+          # CRITICAL: Clear proxy env vars so subsequent Node.js steps (upload-artifact,
+          # checkout cleanup) don't try to use SOCKS5 which they don't support
+          echo "ALL_PROXY=" >> $GITHUB_ENV
+          echo "HTTP_PROXY=" >> $GITHUB_ENV
+          echo "HTTPS_PROXY=" >> $GITHUB_ENV
+
+          exit $PYTHON_EXIT
+
+      - name: 📸 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        env:
+          # 显式清空代理环境变量给 upload-artifact@v4 用 (Node undici 解析代理 URL,
+          # socks5h:// 它不支持会抛 "Invalid URL protocol" 错误).
+          # 注意: GitHub Actions env key 不区分大小写 (case-insensitive),
+          # 不能同时写 ALL_PROXY 和 all_proxy 否则会被拒 "X is already defined".
+          # 这里只保留大写形式 + NO_PROXY, 全部置空让 Node 不使用任何代理.
+          ALL_PROXY: ''
+          HTTP_PROXY: ''
+          HTTPS_PROXY: ''
+          NO_PROXY: '*'
+        with:
+          name: debug-${{ github.run_number }}
+          path: |
+            ./screenshots/*.png
+            ${{ github.event.inputs.enable_recording == 'true' && '/tmp/recording.mp4' || '' }}
+          if-no-files-found: ignore
+          retention-days: 3
