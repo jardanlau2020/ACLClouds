@@ -426,6 +426,47 @@ def _click_turnstile(sb):
     return False
 
 
+def _dump_captcha_widget(sb, max_elems=80):
+    """Dump 'Click on X' 挑战 widget 的可见元素结构 (tag/class/text/位置) 到日志, 供排查点击为何未生效"""
+    try:
+        info = sb.driver.execute_script("""
+            var all = document.querySelectorAll('*');
+            var cands = [];
+            for (var el of all) {
+                var txt = (el.textContent || '').trim().toLowerCase();
+                if (txt.indexOf('click on') === 0 && txt.length < 40) cands.push(el);
+            }
+            if (!cands.length) return null;
+            cands.sort(function(a,b){ return a.querySelectorAll('*').length - b.querySelectorAll('*').length; });
+            var anchor = cands[0];
+            var box = anchor;
+            for (var i = 0; i < 10 && box; i++) { box = box.parentElement; if (box === document.body) break; }
+            if (!box) box = document.body;
+            var out = [];
+            var nodes = box.querySelectorAll('div, button, a, span, canvas, img, label, p, svg, input');
+            for (var n of nodes) {
+                var r = n.getBoundingClientRect();
+                if (r.width < 2 || r.height < 2) continue;
+                out.push({
+                    tag: n.tagName,
+                    cls: (n.className || '').toString().slice(0, 50),
+                    id: n.id,
+                    txt: (n.textContent || '').trim().slice(0, 18),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    x: Math.round(r.x), y: Math.round(r.y)
+                });
+            }
+            return JSON.stringify(out.slice(0, arguments[0]));
+        """, max_elems)
+        if info:
+            log(f"   🔬 挑战 widget DOM (前 {max_elems} 个可见元素):")
+            log("   " + info[:3000])
+        else:
+            log("   🔬 挑战 widget DOM: 未找到 'Click on' 锚点")
+    except Exception as e:
+        log(f"   挑战 widget DOM dump 失败: {e}")
+
+
 def _challenge_card(sb):
     """面板自定义挑战 'Click on X': 解析页面里 'Click on {词}' 的目标词,
     在挑战盒 (锚点的祖先容器) 内点击同名卡片 (scratch 卡: VPS/Minecraft/Discord/Cloud)。
@@ -487,11 +528,12 @@ def _challenge_card(sb):
         """, target)
     except Exception:
         clicked = False
-    if clicked:
+    if not clicked:
+        log(f"   ⚠️ '{target}' 卡片未点中, dump widget 结构排查...")
+        _dump_captcha_widget(sb)
+    else:
         log(f"   ✅ 已点击 '{target}' 卡片")
-        return True
-    log(f"   ⚠️ '{target}' 卡片未点中")
-    return False
+    return clicked
 
 
 def _discord_oauth_login(sb):
@@ -792,6 +834,8 @@ def _browser_do_login(sb):
             solved = True
             log("✅ 页面无待解人机验证")
             break
+        if attempt == 1:
+            _dump_captcha_widget(sb)
         # 2a) 先点复选框 (激活挑战可能需要这一步)
         try:
             sb.driver.switch_to.default_content()
