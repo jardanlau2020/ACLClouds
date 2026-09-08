@@ -653,6 +653,59 @@ def _browser_do_login(sb):
             return True
 
     # 1) 等 Turnstile iframe 出现 (最多 30s)
+    def _submit_and_wait():
+        """提交登录表单并等待跳转, 返回是否离开登录页 (验证码失败时自动重试一轮)"""
+        for cycle in range(1, 3):
+            submit_ok = False
+            for sel in ('button[type="submit"]',
+                        'button:contains("Sign in")', 'button:contains("Login")',
+                        'button:contains("Se connecter")', 'button:contains("Connexion")'):
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.click(sel)
+                        submit_ok = True
+                        log(f"✅ 已点击登录按钮: {sel}")
+                        break
+                except Exception:
+                    continue
+            if not submit_ok:
+                log("⚠️ 未找到登录提交按钮, 尝试回车提交")
+                try:
+                    sb.enter()
+                except Exception:
+                    pass
+            # 等待跳转离开登录页
+            for _ in range(40):
+                url = sb.get_current_url()
+                if "auth/login" not in url and "login" not in url.lower():
+                    log(f"✅ 登录成功, 当前页面: {url}")
+                    return True
+                sb.sleep(1)
+            # 检查是否验证码错误, 是则重新点验证框再提交一轮
+            try:
+                body = sb.get_text("body") or ""
+            except Exception:
+                body = ""
+            if "captcha" in body.lower():
+                log(f"⏳ 第 {cycle} 次提交后提示验证码错误, 重新点击验证框并提交...")
+                try:
+                    sb.uc_gui_click_captcha()
+                except Exception:
+                    pass
+                sb.sleep(7)
+                continue
+            break
+        log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
+        try:
+            print("   📝 页面内容:", sb.get_text("body")[:300])
+        except Exception:
+            pass
+        try:
+            sb.save_screenshot("acl_login_failed.png")
+        except Exception:
+            pass
+        return False
+
     widget_seen = False
     for _ in range(15):
         frs = _page_iframes()
@@ -662,8 +715,11 @@ def _browser_do_login(sb):
             break
         sb.sleep(2)
     if not widget_seen:
-        log("⚠️ 30 秒内未出现 Turnstile iframe (组件被拦或未加载)")
-        log("   改用 Discord OAuth 登录回退...")
+        log("⚠️ 30 秒内未出现 Turnstile iframe, 尝试直接提交登录 (面板可能未强制 Turnstile)")
+        if _submit_and_wait():
+            log("✅ 免 Turnstile 直接提交登录成功")
+            return True
+        log("   直接提交未过, 改用 Discord OAuth 登录回退...")
         return _discord_oauth_login(sb) is not None
 
     # 2) 点击复选框直到 token 生成
@@ -685,71 +741,15 @@ def _browser_do_login(sb):
             break
         log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试...")
     if not turnstile_ok:
-        log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控)")
+        log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控), 先试直接提交")
+        if _submit_and_wait():
+            log("✅ 直接提交登录成功 (Turnstile 未强制)")
+            return True
         log("   改用 Discord OAuth 登录回退...")
         return _discord_oauth_login(sb) is not None
 
     # 提交登录 + 等待跳转 (验证码失败时自动重试一轮)
-    logged_in = False
-    for cycle in range(1, 3):
-        submit_ok = False
-        for sel in ('button[type="submit"]',
-                    'button:contains("Sign in")', 'button:contains("Login")',
-                    'button:contains("Se connecter")', 'button:contains("Connexion")'):
-            try:
-                if sb.is_element_visible(sel):
-                    sb.click(sel)
-                    submit_ok = True
-                    log(f"✅ 已点击登录按钮: {sel}")
-                    break
-            except Exception:
-                continue
-        if not submit_ok:
-            log("⚠️ 未找到登录提交按钮, 尝试回车提交")
-            try:
-                sb.enter()
-            except Exception:
-                pass
-
-        # 等待跳转离开登录页
-        for _ in range(40):
-            url = sb.get_current_url()
-            if "auth/login" not in url and "login" not in url.lower():
-                logged_in = True
-                break
-            sb.sleep(1)
-        if logged_in:
-            break
-
-        # 检查是否验证码错误, 是则重新点验证框再提交一轮
-        try:
-            body = sb.get_text("body") or ""
-        except Exception:
-            body = ""
-        if "captcha" in body.lower():
-            log(f"⏳ 第 {cycle} 次提交后提示验证码错误, 重新点击验证框并提交...")
-            try:
-                sb.uc_gui_click_captcha()
-            except Exception:
-                pass
-            sb.sleep(7)
-            continue
-        break
-
-    if not logged_in:
-        log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
-        try:
-            print("   📝 页面内容:", sb.get_text("body")[:300])
-        except Exception:
-            pass
-        try:
-            sb.save_screenshot("acl_login_failed.png")
-        except Exception:
-            pass
-        return False
-
-    log(f"✅ 登录成功, 当前页面: {sb.get_current_url()}")
-    return True
+    return _submit_and_wait()
 
 
 def browser_login():
