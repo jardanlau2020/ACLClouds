@@ -17,6 +17,11 @@ on:
         default: 'false'
         type: choice
         options: ['false', 'true']
+      node_link:
+        description: 'Override proxy node link (vless/vmess/tuic/hy2). Empty = use NODE_LINK secret'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -61,7 +66,7 @@ jobs:
 
       - name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+          NODE_LINK: ${{ inputs.node_link || secrets.NODE_LINK }}
         run: |
           set -e
 
