@@ -27,14 +27,18 @@ def main() -> int:
         print(f"⚠️ 不支持的 scheme: {u.scheme}", file=sys.stderr)
         return 1
 
-    # auth 部分: uuid%3Auuid (URL-encoded "uuid:uuid"), 取第一段
-    uuid = unquote(u.username or "")
-    uuid = uuid.split(":")[0].strip()
+    # auth 部分: uuid%3Apassword (URL-encoded "uuid:password")
+    auth = unquote(u.username or "")
+    parts = auth.split(":")
+    uuid = parts[0].strip()
+    # TUIC v1: password 恒等於 uuid; v3: 獨立. 有第二段用第二段, 冇就照舊 (uuid 頂替)
+    password = (parts[1].strip() if len(parts) > 1 else uuid)
     host = u.hostname
     port = u.port
     q = parse_qs(u.query)
 
     server_name = (q.get("sni") or [host or ""])[0]
+    congestion = (q.get("congestion_control") or [""])[0]
     alpn = (q.get("alpn") or ["h3"])[0]
     insecure = str((q.get("allow_insecure") or ["0"])[0]).lower() in ("1", "true", "yes")
 
@@ -42,7 +46,7 @@ def main() -> int:
     listen_port = int(os.environ.get("TUIC_BRIDGE_PORT", "10800"))
 
     config = {
-        "log": {"level": "warning"},
+        "log": {"level": "info"},
         "inbounds": [
             {
                 "type": "mixed",
@@ -58,6 +62,9 @@ def main() -> int:
                 "server": host,
                 "server_port": port,
                 "uuid": uuid,
+                "password": password,
+                "congestion_control": congestion or "bbr",
+                "udp_relay_mode": "native",
                 "tls": {
                     "enabled": True,
                     "server_name": server_name,
