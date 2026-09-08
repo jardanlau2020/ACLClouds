@@ -35,6 +35,39 @@ jobs:
           pip install -r requirements.txt
           seleniumbase install chromedriver || true
 
+      - name: 啟動本地 TUIC 代理橋 (sing-box)
+        if: ${{ secrets.TUIC_PROXY != '' }}
+        env:
+          TUIC_PROXY: ${{ secrets.TUIC_PROXY }}
+        run: |
+          set -e
+          cd /tmp
+          curl -sL -o sb.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz
+          tar xzf sb.tar.gz
+          SB="sing-box-1.14.0-linux-amd64/sing-box"
+          chmod +x "$SB"
+          TUIC_PROXY="$TUIC_PROXY" python3 "$GITHUB_WORKSPACE/tuic_bridge.py" > /tmp/tuic.json
+          # 只印非敏感参数 (uuid 不入 log)
+          python3 -c "
+          import json
+          c=json.load(open('/tmp/tuic.json'))
+          o=c['outbounds'][0]
+          print('🔌 TUIC 橋:', o['server'], ':', o['server_port'], 'sni=', o['tls']['server_name'], 'alpn=', o['tls'].get('alpn'))
+          "
+          "$SB" run -c /tmp/tuic.json > /tmp/tuic.log 2>&1 &
+          echo $! > /tmp/tuic.pid
+          ok=""
+          for i in $(seq 1 30); do
+            IP=$(curl -s --max-time 6 -x http://127.0.0.1:10800 https://api.ipify.org 2>/dev/null || true)
+            if [ -n "$IP" ]; then ok=1; echo "✅ TUIC 橋已就緒, 代理出口 IP: $IP"; break; fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "❌ TUIC 橋 30s 未通, sing-box 日志:"
+            tail -20 /tmp/tuic.log
+            exit 1
+          fi
+
       - name: 执行续期
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
@@ -42,8 +75,8 @@ jobs:
           ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          IS_PROXY: ${{ secrets.IS_PROXY }}
-          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          IS_PROXY: ${{ (secrets.TUIC_PROXY != '' && 'true') || secrets.IS_PROXY }}
+          PROXY_SERVER: ${{ (secrets.TUIC_PROXY != '' && 'http://127.0.0.1:10800') || secrets.PROXY_SERVER }}
           GH_REPO: ${{ secrets.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
