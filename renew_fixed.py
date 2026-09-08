@@ -426,6 +426,58 @@ def _click_turnstile(sb):
     return False
 
 
+def _challenge_card(sb):
+    """面板自定义挑战 'Click on X': 解析页面里 'Click on {词}' 的目标词,
+    在挑战盒 (锚点元素的祖先容器) 内点击同名的卡片 (scratch 卡: VPS/Minecraft/Discord/Cloud)。
+
+    返回: True=点中卡片; False=页面无该挑战或没点中。
+    """
+    try:
+        sb.driver.switch_to.default_content()
+        pg = sb.get_page_source()
+    except Exception:
+        return False
+    m = re.search(r'[Cc]lick on\s+([A-Za-z]+)', pg)
+    if not m:
+        return False
+    target = m.group(1)
+    log(f"   🔣 自定义挑战: 需点击 '{target}' 卡片")
+    try:
+        clicked = sb.driver.execute_script("""
+            var t = arguments[0].toLowerCase();
+            var all = document.querySelectorAll('div, span, p, label');
+            var cands = [];
+            for (var el of all) {
+                var txt = (el.textContent || '').trim().toLowerCase();
+                if (txt.indexOf('click on') === 0 && txt.length < 30) cands.push(el);
+            }
+            if (!cands.length) return false;
+            // 取文本最短 (最内层) 的 'Click on' 元素作为锚点
+            cands.sort(function(a, b){ return a.textContent.length - b.textContent.length; });
+            var anchor = cands[0];
+            // 从锚点向上 8 层找同文本卡片
+            var box = anchor;
+            for (var i = 0; i < 8 && box; i++) {
+                box = box.parentElement;
+                if (!box) continue;
+                var cards = box.querySelectorAll('div, button, a, span');
+                for (var c of cards) {
+                    if (c.children.length === 0
+                        && (c.textContent || '').trim().toLowerCase() === t
+                        && c.offsetParent !== null) { c.click(); return true; }
+                }
+            }
+            return false;
+        """, target)
+    except Exception:
+        clicked = False
+    if clicked:
+        log(f"   ✅ 已点击 '{target}' 卡片")
+        return True
+    log(f"   ⚠️ '{target}' 卡片未点中")
+    return False
+
+
 def _discord_oauth_login(sb):
     """Discord OAuth 登录回退 (账号需绑定 Discord; Turnstile 不可用时自动使用)
 
@@ -687,12 +739,13 @@ def _browser_do_login(sb):
             except Exception:
                 body = ""
             if "captcha" in body.lower():
-                log(f"⏳ 第 {cycle} 次提交后提示验证码错误, 重新点击验证框并提交...")
+                log(f"⏳ 第 {cycle} 次提交后提示验证码错误, 重新解挑战卡并提交...")
                 try:
                     sb.uc_gui_click_captcha()
                 except Exception:
                     pass
-                sb.sleep(7)
+                _challenge_card(sb)
+                sb.sleep(4)
                 continue
             break
         log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
@@ -706,19 +759,24 @@ def _browser_do_login(sb):
             pass
         return False
 
-    # 2) 点 "I am not a robot" 复选框直到 token 生成
-    #    实测 Turnstile iframe 在点中复选框后才出现, 不能干等; 三段点击策略:
-    #    uc GUI 点击 → iframe 直接点击 → "I am not a robot" 占位元素
-    def _click_any_captcha():
+    # 2) 解人机验证: 面板自定义挑战
+    #    "I am not a robot" 复选框 → "Click on X" 刮刮卡 (目标词每轮随机: VPS/Minecraft/Discord/Cloud)
+    def _challenge_pending():
         try:
-            if sb.uc_gui_click_captcha():
-                log("   ✅ uc GUI 点击验证框")
-                return True
+            pg = sb.get_page_source().lower()
         except Exception:
-            pass
-        if _click_turnstile(sb):
-            log("   ✅ iframe 直接点击验证框")
+            return False
+        if re.search(r"click on\s+[a-z]+", pg):
             return True
+        return "i am not a robot" in pg
+
+    solved = False
+    for attempt in range(1, 6):
+        if not _challenge_pending():
+            solved = True
+            log("✅ 页面无待解人机验证")
+            break
+        # 2a) 先点复选框 (激活挑战可能需要这一步)
         try:
             sb.driver.switch_to.default_content()
             for el in sb.driver.find_elements("css selector", "div, span, label"):
@@ -726,33 +784,19 @@ def _browser_do_login(sb):
                     t = (el.text or "").strip().lower()
                     if t == "i am not a robot" and el.is_displayed():
                         el.click()
-                        log("   ✅ 点击 'I am not a robot' 占位元素")
-                        return True
+                        break
                 except Exception:
                     continue
         except Exception:
             pass
-        return False
-
-    turnstile_ok = False
-    for attempt in range(1, 6):
-        clicked = _click_any_captcha()
-        log(f"   第 {attempt} 次点验证框: {'已点击' if clicked else '未找到可点元素 (widget 可能尚未加载)'}")
-        sb.sleep(8)
-        if _captcha_passed():
-            turnstile_ok = True
-            log("✅ Turnstile 验证已通过 (响应 token 已生成)")
-            break
-        log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试...")
-    if not turnstile_ok:
-        log("⚠️ Turnstile 未通过 (IP 可能被 CF 风控), 先试直接提交")
-        if _submit_and_wait():
-            log("✅ 直接提交登录成功 (Turnstile 未强制)")
-            return True
-        log("   改用 Discord OAuth 登录回退...")
-        return _discord_oauth_login(sb) is not None
-
-    # 提交登录 + 等待跳转 (验证码失败时自动重试一轮)
+        sb.sleep(2)
+        # 2b) 点 'Click on X' 挑战卡
+        _challenge_card(sb)
+        log(f"   第 {attempt} 轮: 已处理挑战, 等待刷新...")
+        sb.sleep(4)
+    if not solved:
+        log("⚠️ 5 轮后自定义挑战未解, 仍尝试提交 (面板可能未强制)")
+    # 3) 提交登录 (captcha 错误时 _submit_and_wait 会自动重点卡片再试)
     return _submit_and_wait()
 
 
@@ -934,21 +978,24 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
             #    找不到再试 /servers/{短id} 直连
             page_ok = False
             srv_name_l = srv['name'].lower()
-            try:
-                sb.open(BASE_URL + "/")
-                sb.wait_for_ready_state_complete()
-                sb.sleep(3)
-                for a in driver.find_elements("css selector", "a"):
-                    try:
-                        if a.is_displayed() and srv_name_l in (a.text or '').lower():
-                            a.click()
-                            sb.sleep(3)
-                            page_ok = True
-                            break
-                    except Exception:
-                        continue
-            except Exception as e:
-                log(f"   dashboard 查找异常: {e}")
+            for base in (BASE_URL + "/", BASE_URL + "/dashboard"):
+                if page_ok:
+                    break
+                try:
+                    sb.open(base)
+                    sb.wait_for_ready_state_complete()
+                    sb.sleep(3)
+                    for a in driver.find_elements("css selector", "a"):
+                        try:
+                            if a.is_displayed() and srv_name_l in (a.text or '').lower():
+                                a.click()
+                                sb.sleep(3)
+                                page_ok = True
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    log(f"   {base} 查找异常: {e}")
             if not page_ok:
                 log(f"   dashboard 未找到, 试 /servers/{srv['id']} 直连...")
                 try:
@@ -1035,26 +1082,24 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
             except Exception:
                 pass
             sb.sleep(2)
-            # 6) 续期动作可能再弹 Turnstile, 点击直到 token 生成
+            # 6) 续期动作可能再弹人机验证 (CF Turnstile 或 'Click on X' 卡片), 循环处理直到无
             for i in range(1, 6):
-                token_ok = False
+                pending = False
                 try:
-                    driver.switch_to.default_content()
-                    tok = driver.execute_script(
-                        "var el=document.querySelector('textarea[name=\"cf-turnstile-response\"],"
-                        "input[name=\"cf-turnstile-response\"]');"
-                        "return !!(el&&el.value&&el.value.length>10);")
-                    token_ok = bool(tok)
+                    pg = sb.get_page_source().lower()
+                    if re.search(r"click on\s+[a-z]+", pg):
+                        pending = True
+                    if "i am not a robot" in pg:
+                        pending = True
                 except Exception:
                     pass
-                if token_ok:
-                    log("   Turnstile token 已生成")
+                if not pending:
+                    log("   页面无待解人机验证")
                     break
+                _challenge_card(sb)
                 if _click_turnstile(sb):
                     log(f"   第 {i} 次点击续期动作 Turnstile...")
-                else:
-                    break
-                sb.sleep(3)
+                sb.sleep(4)
             sb.sleep(4)
             try:
                 sb.save_screenshot("acl_browser_renew_clicked.png")
