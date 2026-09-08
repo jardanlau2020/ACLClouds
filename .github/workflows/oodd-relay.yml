@@ -46,8 +46,10 @@ jobs:
           mkdir -p oodd/results
           {
             echo "\$ ssh -6 root@$HOST 'bash -s' < $CMD"
-            echo "$OODD_PW" | sshpass -e ssh -6 -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=25 -o ServerAliveInterval=15 root@"$HOST" 'bash -s' < "$CMD" 2>&1
+            set +e
+            SSHPASS="$OODD_PW" sshpass -e ssh -6 -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=25 -o ServerAliveInterval=15 root@"$HOST" 'bash -s' < "$CMD" 2>&1
             rc=$?
+            set -e
             echo "=== ssh exit code: $rc ==="
           } | tee "$OUT"
           echo "result committed to $OUT"
