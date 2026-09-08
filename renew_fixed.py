@@ -428,7 +428,7 @@ def _click_turnstile(sb):
 
 def _challenge_card(sb):
     """面板自定义挑战 'Click on X': 解析页面里 'Click on {词}' 的目标词,
-    在挑战盒 (锚点元素的祖先容器) 内点击同名的卡片 (scratch 卡: VPS/Minecraft/Discord/Cloud)。
+    在挑战盒 (锚点的祖先容器) 内点击同名卡片 (scratch 卡: VPS/Minecraft/Discord/Cloud)。
 
     返回: True=点中卡片; False=页面无该挑战或没点中。
     """
@@ -445,26 +445,42 @@ def _challenge_card(sb):
     try:
         clicked = sb.driver.execute_script("""
             var t = arguments[0].toLowerCase();
-            var all = document.querySelectorAll('div, span, p, label');
+            // 1) 找 "Click on X" 指令的最内层元素作为锚点
+            var all = document.querySelectorAll('div, span, p, label, b, strong, a');
             var cands = [];
             for (var el of all) {
                 var txt = (el.textContent || '').trim().toLowerCase();
-                if (txt.indexOf('click on') === 0 && txt.length < 30) cands.push(el);
+                if (txt.indexOf('click on') === 0 && txt.length < 40) cands.push(el);
             }
             if (!cands.length) return false;
-            // 取文本最短 (最内层) 的 'Click on' 元素作为锚点
-            cands.sort(function(a, b){ return a.textContent.length - b.textContent.length; });
+            cands.sort(function(a,b){ return a.querySelectorAll('*').length - b.querySelectorAll('*').length; });
             var anchor = cands[0];
-            // 从锚点向上 8 层找同文本卡片
+            // 2) 从锚点向上找包含目标词卡片的容器; 选面积最小的可见匹配 (卡片本身而非容器)
             var box = anchor;
-            for (var i = 0; i < 8 && box; i++) {
+            for (var i = 0; i < 12 && box; i++) {
                 box = box.parentElement;
-                if (!box) continue;
-                var cards = box.querySelectorAll('div, button, a, span');
-                for (var c of cards) {
-                    if (c.children.length === 0
-                        && (c.textContent || '').trim().toLowerCase() === t
-                        && c.offsetParent !== null) { c.click(); return true; }
+                if (!box) break;
+                var cands2 = box.querySelectorAll('div, button, a, span, p, label');
+                var matches = [];
+                for (var c of cands2) {
+                    var ct = (c.textContent || '').trim().toLowerCase();
+                    if (ct === t) {
+                        var r0 = c.getBoundingClientRect();
+                        if (r0.width > 0 && r0.height > 0) matches.push({el: c, area: r0.width * r0.height});
+                    }
+                }
+                if (matches.length > 0) {
+                    matches.sort(function(a,b){ return a.area - b.area; });
+                    var el = matches[0].el;
+                    var r = el.getBoundingClientRect();
+                    var x = r.left + r.width / 2, y = r.top + r.height / 2;
+                    var opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0};
+                    try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch(e){}
+                    try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch(e){}
+                    try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch(e){}
+                    try { el.dispatchEvent(new MouseEvent('mouseup', opts)); } catch(e){}
+                    el.click();
+                    return true;
                 }
             }
             return false;
