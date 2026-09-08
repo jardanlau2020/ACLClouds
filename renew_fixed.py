@@ -706,34 +706,38 @@ def _browser_do_login(sb):
             pass
         return False
 
-    widget_seen = False
-    for _ in range(15):
-        frs = _page_iframes()
-        if frs and any(("cloudflare" in x.lower()) or ("turnstile" in x.lower()) for x in frs):
-            log(f"🔍 检测到 Turnstile iframe: {[x[:70] for x in frs]}")
-            widget_seen = True
-            break
-        sb.sleep(2)
-    if not widget_seen:
-        log("⚠️ 30 秒内未出现 Turnstile iframe, 尝试直接提交登录 (面板可能未强制 Turnstile)")
-        if _submit_and_wait():
-            log("✅ 免 Turnstile 直接提交登录成功")
-            return True
-        log("   直接提交未过, 改用 Discord OAuth 登录回退...")
-        return _discord_oauth_login(sb) is not None
-
-    # 2) 点击复选框直到 token 生成
-    turnstile_ok = False
-    for attempt in range(1, 5):
-        clicked = False
+    # 2) 点 "I am not a robot" 复选框直到 token 生成
+    #    实测 Turnstile iframe 在点中复选框后才出现, 不能干等; 三段点击策略:
+    #    uc GUI 点击 → iframe 直接点击 → "I am not a robot" 占位元素
+    def _click_any_captcha():
         try:
-            clicked = sb.uc_gui_click_captcha()
-        except Exception as e:
-            log(f"   ⚠️ uc 点击异常: {e}")
-        if not clicked:
-            # 无真实显示器时 GUI 点击不可用, 改 iframe 直接点击
-            clicked = _click_turnstile(sb)
-        log(f"   第 {attempt} 次点击验证框: {'已点击' if clicked else '未找到'}")
+            if sb.uc_gui_click_captcha():
+                log("   ✅ uc GUI 点击验证框")
+                return True
+        except Exception:
+            pass
+        if _click_turnstile(sb):
+            log("   ✅ iframe 直接点击验证框")
+            return True
+        try:
+            sb.driver.switch_to.default_content()
+            for el in sb.driver.find_elements("css selector", "div, span, label"):
+                try:
+                    t = (el.text or "").strip().lower()
+                    if t == "i am not a robot" and el.is_displayed():
+                        el.click()
+                        log("   ✅ 点击 'I am not a robot' 占位元素")
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    turnstile_ok = False
+    for attempt in range(1, 6):
+        clicked = _click_any_captcha()
+        log(f"   第 {attempt} 次点验证框: {'已点击' if clicked else '未找到可点元素 (widget 可能尚未加载)'}")
         sb.sleep(8)
         if _captcha_passed():
             turnstile_ok = True
@@ -741,7 +745,7 @@ def _browser_do_login(sb):
             break
         log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试...")
     if not turnstile_ok:
-        log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控), 先试直接提交")
+        log("⚠️ Turnstile 未通过 (IP 可能被 CF 风控), 先试直接提交")
         if _submit_and_wait():
             log("✅ 直接提交登录成功 (Turnstile 未强制)")
             return True
@@ -911,6 +915,9 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                 cks = _cookie_list(cookie_str)
                 log(f"   cookie 注入 fallback: 注入 {len(cks)} 个 cookie")
                 sb.open(BASE_URL + "/")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(2)
+                _pass_cf_challenge(sb)
                 try:
                     driver.delete_all_cookies()
                 except Exception:
@@ -919,11 +926,10 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                     try:
                         driver.add_cookie(c)
                     except Exception as e:
-                        log(f"   ⚠️ 注入 cookie {c['name']} 失败: {e}")
+                        log(f"   ⚠️ 注入 cookie {c['name']} 失败: {str(e)[:100]}")
                 sb.open(BASE_URL + "/")
                 sb.wait_for_ready_state_complete()
                 sb.sleep(2)
-                _pass_cf_challenge(sb)
             # 3) 找服务器页: 先由 dashboard 按 server 名找 link (发现式, 适配自定义面板),
             #    找不到再试 /servers/{短id} 直连
             page_ok = False
