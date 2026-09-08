@@ -49,3 +49,14 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         # xvfb-run 提供虚拟显示器, uc_gui_click_captcha 的 GUI 点击才能工作
         run: xvfb-run --auto-servernum python renew_fixed.py
+
+      - name: 📸 上传调试截图 (如有)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acl-debug-screenshots
+          path: |
+            acl_browser_*.png
+            acl_login_failed.png
+          if-no-files-found: ignore
+          retention-days: 5

@@ -575,6 +575,183 @@ def _discord_oauth_login(sb):
         return None
 
 
+
+# ==================== 登录页交互 (抽自 browser_login, 供续期 fallback 复用) ====================
+# 在已打开的 sb 上执行: 打开 /auth/login → 填账密 → 过 Turnstile → 提交 → 等跳转
+# 成功返回 True (sb 处于已登录状态), 失败返回 False
+def _browser_do_login(sb):
+    sb.open("https://aclclouds.com/auth/login")
+    sb.wait_for_ready_state_complete()
+    sb.sleep(3)
+    log(f"📝 当前 URL: {sb.get_current_url()}")
+    _dump_login_form(sb)
+
+    # 填邮箱
+    email_filled = False
+    for sel in ('input[name="email"]', 'input[type="email"]',
+                'input[autocomplete="email"]', 'input[placeholder*="example.com"]'):
+        try:
+            if sb.is_element_visible(sel):
+                sb.type(sel, ACL_EMAIL)
+                email_filled = True
+                log(f"✅ 已填写邮箱: {sel}")
+                break
+        except Exception:
+            continue
+
+    # 填密码
+    pw_filled = False
+    for sel in ('input[name="password"]', 'input[type="password"]',
+                'input[autocomplete="current-password"]'):
+        try:
+            if sb.is_element_visible(sel):
+                sb.type(sel, ACL_PASSWORD)
+                pw_filled = True
+                log(f"✅ 已填写密码: {sel}")
+                break
+        except Exception:
+            continue
+
+    if not (email_filled and pw_filled):
+        log("❌ 未找到邮箱/密码输入框 (表单结构可能已变)")
+        _dump_login_form(sb)
+        try:
+            sb.save_screenshot("acl_login_form.png")
+        except Exception:
+            pass
+        return False
+
+    # Turnstile: 先等组件 iframe 出现, 再点击直到 token 真正生成
+    log("🔒 尝试通过 Turnstile 验证...")
+
+    def _page_iframes():
+        """原生 driver 枚举 iframe (sb.execute_script 在登录页返回值不可靠)"""
+        try:
+            sb.driver.switch_to.default_content()
+            frs = sb.driver.find_elements("css selector", "iframe")
+            return [(f.get_attribute("src") or "") + " " + (f.get_attribute("title") or "")
+                    for f in frs]
+        except Exception:
+            return []
+
+    def _captcha_passed():
+        try:
+            sb.driver.switch_to.default_content()
+            tok = sb.driver.execute_script(
+                "var el=document.querySelector('textarea[name=\"cf-turnstile-response\"],"
+                "input[name=\"cf-turnstile-response\"]');"
+                "return !!(el&&el.value&&el.value.length>10);")
+            if tok:
+                return True
+        except Exception:
+            pass
+        try:
+            pg = sb.get_page_source().lower()
+            return not any(k in pg for k in
+                           ("i am not a robot", "captcha incorrect", "secured by aclclouds"))
+        except Exception:
+            return True
+
+    # 1) 等 Turnstile iframe 出现 (最多 30s)
+    widget_seen = False
+    for _ in range(15):
+        frs = _page_iframes()
+        if frs and any(("cloudflare" in x.lower()) or ("turnstile" in x.lower()) for x in frs):
+            log(f"🔍 检测到 Turnstile iframe: {[x[:70] for x in frs]}")
+            widget_seen = True
+            break
+        sb.sleep(2)
+    if not widget_seen:
+        log("⚠️ 30 秒内未出现 Turnstile iframe (组件被拦或未加载)")
+        log("   改用 Discord OAuth 登录回退...")
+        return _discord_oauth_login(sb) is not None
+
+    # 2) 点击复选框直到 token 生成
+    turnstile_ok = False
+    for attempt in range(1, 5):
+        clicked = False
+        try:
+            clicked = sb.uc_gui_click_captcha()
+        except Exception as e:
+            log(f"   ⚠️ uc 点击异常: {e}")
+        if not clicked:
+            # 无真实显示器时 GUI 点击不可用, 改 iframe 直接点击
+            clicked = _click_turnstile(sb)
+        log(f"   第 {attempt} 次点击验证框: {'已点击' if clicked else '未找到'}")
+        sb.sleep(8)
+        if _captcha_passed():
+            turnstile_ok = True
+            log("✅ Turnstile 验证已通过 (响应 token 已生成)")
+            break
+        log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试...")
+    if not turnstile_ok:
+        log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控)")
+        log("   改用 Discord OAuth 登录回退...")
+        return _discord_oauth_login(sb) is not None
+
+    # 提交登录 + 等待跳转 (验证码失败时自动重试一轮)
+    logged_in = False
+    for cycle in range(1, 3):
+        submit_ok = False
+        for sel in ('button[type="submit"]',
+                    'button:contains("Sign in")', 'button:contains("Login")',
+                    'button:contains("Se connecter")', 'button:contains("Connexion")'):
+            try:
+                if sb.is_element_visible(sel):
+                    sb.click(sel)
+                    submit_ok = True
+                    log(f"✅ 已点击登录按钮: {sel}")
+                    break
+            except Exception:
+                continue
+        if not submit_ok:
+            log("⚠️ 未找到登录提交按钮, 尝试回车提交")
+            try:
+                sb.enter()
+            except Exception:
+                pass
+
+        # 等待跳转离开登录页
+        for _ in range(40):
+            url = sb.get_current_url()
+            if "auth/login" not in url and "login" not in url.lower():
+                logged_in = True
+                break
+            sb.sleep(1)
+        if logged_in:
+            break
+
+        # 检查是否验证码错误, 是则重新点验证框再提交一轮
+        try:
+            body = sb.get_text("body") or ""
+        except Exception:
+            body = ""
+        if "captcha" in body.lower():
+            log(f"⏳ 第 {cycle} 次提交后提示验证码错误, 重新点击验证框并提交...")
+            try:
+                sb.uc_gui_click_captcha()
+            except Exception:
+                pass
+            sb.sleep(7)
+            continue
+        break
+
+    if not logged_in:
+        log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
+        try:
+            print("   📝 页面内容:", sb.get_text("body")[:300])
+        except Exception:
+            pass
+        try:
+            sb.save_screenshot("acl_login_failed.png")
+        except Exception:
+            pass
+        return False
+
+    log(f"✅ 登录成功, 当前页面: {sb.get_current_url()}")
+    return True
+
+
 def browser_login():
     """用浏览器登录 aclclouds.com, 返回 Cookie 字符串; 失败返回 None
 
@@ -600,175 +777,8 @@ def browser_login():
     log("🚀 启动浏览器登录 aclclouds.com ...")
     try:
         with SB(**kwargs) as sb:
-            sb.open("https://aclclouds.com/auth/login")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(3)
-            log(f"📝 当前 URL: {sb.get_current_url()}")
-            _dump_login_form(sb)
-
-            # 填邮箱
-            email_filled = False
-            for sel in ('input[name="email"]', 'input[type="email"]',
-                        'input[autocomplete="email"]', 'input[placeholder*="example.com"]'):
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.type(sel, ACL_EMAIL)
-                        email_filled = True
-                        log(f"✅ 已填写邮箱: {sel}")
-                        break
-                except Exception:
-                    continue
-
-            # 填密码
-            pw_filled = False
-            for sel in ('input[name="password"]', 'input[type="password"]',
-                        'input[autocomplete="current-password"]'):
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.type(sel, ACL_PASSWORD)
-                        pw_filled = True
-                        log(f"✅ 已填写密码: {sel}")
-                        break
-                except Exception:
-                    continue
-
-            if not (email_filled and pw_filled):
-                log("❌ 未找到邮箱/密码输入框 (表单结构可能已变)")
-                _dump_login_form(sb)
-                try:
-                    sb.save_screenshot("acl_login_form.png")
-                except Exception:
-                    pass
+            if not _browser_do_login(sb):
                 return None
-
-            # Turnstile: 先等组件 iframe 出现, 再点击直到 token 真正生成
-            log("🔒 尝试通过 Turnstile 验证...")
-
-            def _page_iframes():
-                """原生 driver 枚举 iframe (sb.execute_script 在登录页返回值不可靠)"""
-                try:
-                    sb.driver.switch_to.default_content()
-                    frs = sb.driver.find_elements("css selector", "iframe")
-                    return [(f.get_attribute("src") or "") + " " + (f.get_attribute("title") or "")
-                            for f in frs]
-                except Exception:
-                    return []
-
-            def _captcha_passed():
-                try:
-                    sb.driver.switch_to.default_content()
-                    tok = sb.driver.execute_script(
-                        "var el=document.querySelector('textarea[name=\"cf-turnstile-response\"],"
-                        "input[name=\"cf-turnstile-response\"]');"
-                        "return !!(el&&el.value&&el.value.length>10);")
-                    if tok:
-                        return True
-                except Exception:
-                    pass
-                try:
-                    pg = sb.get_page_source().lower()
-                    return not any(k in pg for k in
-                                   ("i am not a robot", "captcha incorrect", "secured by aclclouds"))
-                except Exception:
-                    return True
-
-            # 1) 等 Turnstile iframe 出现 (最多 30s)
-            widget_seen = False
-            for _ in range(15):
-                frs = _page_iframes()
-                if frs and any(("cloudflare" in x.lower()) or ("turnstile" in x.lower()) for x in frs):
-                    log(f"🔍 检测到 Turnstile iframe: {[x[:70] for x in frs]}")
-                    widget_seen = True
-                    break
-                sb.sleep(2)
-            if not widget_seen:
-                log("⚠️ 30 秒内未出现 Turnstile iframe (组件被拦或未加载)")
-                log("   改用 Discord OAuth 登录回退...")
-                return _discord_oauth_login(sb)
-
-            # 2) 点击复选框直到 token 生成
-            turnstile_ok = False
-            for attempt in range(1, 5):
-                clicked = False
-                try:
-                    clicked = sb.uc_gui_click_captcha()
-                except Exception as e:
-                    log(f"   ⚠️ uc 点击异常: {e}")
-                if not clicked:
-                    # 无真实显示器时 GUI 点击不可用, 改 iframe 直接点击
-                    clicked = _click_turnstile(sb)
-                log(f"   第 {attempt} 次点击验证框: {'已点击' if clicked else '未找到'}")
-                sb.sleep(8)
-                if _captcha_passed():
-                    turnstile_ok = True
-                    log("✅ Turnstile 验证已通过 (响应 token 已生成)")
-                    break
-                log(f"   ⏳ 第 {attempt} 次后仍未通过, 重试...")
-            if not turnstile_ok:
-                log("❌ Turnstile 验证未通过 (IP 可能被 CF 风控)")
-                log("   改用 Discord OAuth 登录回退...")
-                return _discord_oauth_login(sb)
-
-            # 提交登录 + 等待跳转 (验证码失败时自动重试一轮)
-            logged_in = False
-            for cycle in range(1, 3):
-                submit_ok = False
-                for sel in ('button[type="submit"]',
-                            'button:contains("Sign in")', 'button:contains("Login")',
-                            'button:contains("Se connecter")', 'button:contains("Connexion")'):
-                    try:
-                        if sb.is_element_visible(sel):
-                            sb.click(sel)
-                            submit_ok = True
-                            log(f"✅ 已点击登录按钮: {sel}")
-                            break
-                    except Exception:
-                        continue
-                if not submit_ok:
-                    log("⚠️ 未找到登录提交按钮, 尝试回车提交")
-                    try:
-                        sb.enter()
-                    except Exception:
-                        pass
-
-                # 等待跳转离开登录页
-                for _ in range(40):
-                    url = sb.get_current_url()
-                    if "auth/login" not in url and "login" not in url.lower():
-                        logged_in = True
-                        break
-                    sb.sleep(1)
-                if logged_in:
-                    break
-
-                # 检查是否验证码错误, 是则重新点验证框再提交一轮
-                try:
-                    body = sb.get_text("body") or ""
-                except Exception:
-                    body = ""
-                if "captcha" in body.lower():
-                    log(f"⏳ 第 {cycle} 次提交后提示验证码错误, 重新点击验证框并提交...")
-                    try:
-                        sb.uc_gui_click_captcha()
-                    except Exception:
-                        pass
-                    sb.sleep(7)
-                    continue
-                break
-
-            if not logged_in:
-                log("❌ 登录后未跳转 (可能 2FA 或验证码未过)")
-                try:
-                    print("   📝 页面内容:", sb.get_text("body")[:300])
-                except Exception:
-                    pass
-                try:
-                    sb.save_screenshot("acl_login_failed.png")
-                except Exception:
-                    pass
-                return None
-
-            log(f"✅ 登录成功, 当前页面: {sb.get_current_url()}")
 
             # 提取 cookie
             cookies = sb.get_cookies()
@@ -879,8 +889,8 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
         kwargs["proxy"] = PROXY_SERVER
         log(f"🔗 浏览器 fallback 走代理: {PROXY_SERVER}")
 
-    cks = _cookie_list(cookie_str)
-    log(f"🌐 浏览器 fallback: 启动 undetected-chrome, 注入 {len(cks)} 个 cookie")
+    use_creds = bool(ACL_EMAIL and ACL_PASSWORD)
+    log(f"🌐 浏览器 fallback: 启动 undetected-chrome ({'账密登录' if use_creds else 'cookie 注入'})")
 
     renew_kw = ("renew", "extension", "extend", "add time",
                 "renouveler", "renouvel", "prolonger", "prolongation",
@@ -891,55 +901,59 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
     try:
         with SB(**kwargs) as sb:
             driver = sb.driver
-            # 1) 先落地建域上下文, 再清旧 cookie 注入账号 cookie
-            sb.open(BASE_URL + "/")
-            try:
-                driver.delete_all_cookies()
-            except Exception:
-                pass
-            for c in cks:
+            # 1) 登录: 账密优先 (浏览器持有自己的 cf_clearance + 真 session); 无账密才 cookie 注入
+            logged_in = False
+            if use_creds:
+                logged_in = _browser_do_login(sb)
+                if logged_in:
+                    log("✅ 浏览器账密登录成功, 进入服务器页")
+            if not logged_in:
+                cks = _cookie_list(cookie_str)
+                log(f"   cookie 注入 fallback: 注入 {len(cks)} 个 cookie")
+                sb.open(BASE_URL + "/")
                 try:
-                    driver.add_cookie(c)
-                except Exception as e:
-                    log(f"   ⚠️ 注入 cookie {c['name']} 失败: {e}")
-            # 2) 重载首页, 过 CF 挑战
-            sb.open(BASE_URL + "/")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(2)
-            if not _pass_cf_challenge(sb):
-                log("❌ 浏览器 fallback 失败: Cloudflare 挑战 90s 未通过")
-                try:
-                    sb.save_screenshot("acl_browser_challenge.png")
+                    driver.delete_all_cookies()
                 except Exception:
                     pass
-                return None
-            # 3) 打开服务器页: 先直连 Pterodactyl 路由 /servers/{短id}
+                for c in cks:
+                    try:
+                        driver.add_cookie(c)
+                    except Exception as e:
+                        log(f"   ⚠️ 注入 cookie {c['name']} 失败: {e}")
+                sb.open(BASE_URL + "/")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(2)
+                _pass_cf_challenge(sb)
+            # 3) 找服务器页: 先由 dashboard 按 server 名找 link (发现式, 适配自定义面板),
+            #    找不到再试 /servers/{短id} 直连
             page_ok = False
+            srv_name_l = srv['name'].lower()
             try:
-                sb.open(f"{BASE_URL}/servers/{srv['id']}")
+                sb.open(BASE_URL + "/")
                 sb.wait_for_ready_state_complete()
                 sb.sleep(3)
-                body_txt = sb.get_text("body").lower()
-                page_ok = srv["name"].lower() in body_txt or f"/servers/{srv['id']}" in sb.get_current_url()
+                for a in driver.find_elements("css selector", "a"):
+                    try:
+                        if a.is_displayed() and srv_name_l in (a.text or '').lower():
+                            a.click()
+                            sb.sleep(3)
+                            page_ok = True
+                            break
+                    except Exception:
+                        continue
             except Exception as e:
-                log(f"   直连服务器页异常: {e}")
+                log(f"   dashboard 查找异常: {e}")
             if not page_ok:
-                log(f"   /servers/{srv['id']} 未达服务器页, 改从服务器列表按名称找...")
+                log(f"   dashboard 未找到, 试 /servers/{srv['id']} 直连...")
                 try:
-                    sb.open(f"{BASE_URL}/servers")
+                    sb.open(f"{BASE_URL}/servers/{srv['id']}")
                     sb.wait_for_ready_state_complete()
                     sb.sleep(3)
-                    for a in driver.find_elements("css selector", "a"):
-                        try:
-                            if srv["name"].lower() in (a.text or "").lower():
-                                a.click()
-                                sb.sleep(3)
-                                page_ok = True
-                                break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
+                    body_txt = sb.get_text("body").lower()
+                    if srv_name_l in body_txt or f"/servers/{srv['id']}" in sb.get_current_url():
+                        page_ok = True
+                except Exception as e:
+                    log(f"   直连服务器页异常: {e}")
             if not page_ok:
                 log(f"❌ 浏览器 fallback 失败: 找不到服务器 {srv['name']} 的页面")
                 try:
@@ -947,9 +961,8 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                 except Exception:
                     pass
                 return None
-            # 4) 找续期按钮并点击 (中/英/法 UI; 排除 auto-renew 开关)
-            clicked = False
-            try:
+            # 4) 找续期按钮并点击 (中/英/法 UI; 排除 auto-renew 开关; 主页面找不到则翻 sub-tab)
+            def _find_and_click_renew():
                 for el in driver.find_elements("css selector", "button, a, [role='button']"):
                     try:
                         if not el.is_displayed():
@@ -961,12 +974,29 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                         if any(k in t for k in renew_kw) and not any(k in t for k in skip_kw):
                             log(f"   找到续期按钮: '{txt[:40]}'")
                             el.click()
-                            clicked = True
-                            break
+                            return True
                     except Exception:
                         continue
-            except Exception as e:
-                log(f"   枚举按钮异常: {e}")
+                return False
+
+            clicked = _find_and_click_renew()
+            if not clicked:
+                tab_kw = ("billing", "renew", "facturation", "extension",
+                          "abonnement", "paiement", "payment", "续期", "计费", "账单")
+                for a in driver.find_elements("css selector", "a, [role='tab'], .tab, .nav-link"):
+                    try:
+                        if not a.is_displayed():
+                            continue
+                        t = (a.text or "").strip().lower()
+                        if any(k in t for k in tab_kw):
+                            log(f"   翻 sub-tab 找续期钮: '{t[:30]}'")
+                            a.click()
+                            sb.sleep(3)
+                            clicked = _find_and_click_renew()
+                            if clicked:
+                                break
+                    except Exception:
+                        continue
             if not clicked:
                 log("❌ 浏览器 fallback 失败: 服务器页未找到续期按钮 (面板 UI 可能变了)")
                 try:
