@@ -1,0 +1,75 @@
+name: oodd-relay
+
+# GH runner 有 IPv6 出街, 呢度借佢做 relay ssh 入 oodd (2a06:9801:700::1b4)
+# 公倉安全: workflow_dispatch + 固定 choice task, 唔收任何自由輸入;
+# oodd 密碼只落 Secrets (OODD_PW), 唔入代码/日誌; 結果檔只讀診斷, 無密。
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "oodd task"
+        type: choice
+        options:
+          - diag
+          - verify
+          - apply-guard
+        default: diag
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install sshpass
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass >/dev/null
+          sshpass -V
+
+      - name: run task over ssh (IPv6)
+        env:
+          OODD_PW: ${{ secrets.OODD_PW }}
+        run: |
+          HOST="2a06:9801:700::1b4"
+          if [ -z "$OODD_PW" ]; then
+            echo "[ERROR] OODD_PW secret 未設定 — 入 GitHub UI (ACLClouds → Settings → Secrets) 加返先"
+            exit 1
+          fi
+          case "${{ inputs.task }}" in
+            diag)        CMD="oodd/diag.sh" ;;
+            verify)      CMD="oodd/verify.sh" ;;
+            apply-guard) CMD="oodd/guard.sh" ;;
+          esac
+          OUT="oodd/results/oodd-${{ inputs.task }}-$(date -u +%Y%m%d-%H%M).txt"
+          mkdir -p oodd/results
+          {
+            echo "\$ ssh -6 root@$HOST 'bash -s' < $CMD"
+            echo "$OODD_PW" | sshpass -e ssh -6 -p 22 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=25 -o ServerAliveInterval=15 root@"$HOST" 'bash -s' < "$CMD" 2>&1
+            rc=$?
+            echo "=== ssh exit code: $rc ==="
+          } | tee "$OUT"
+          echo "result committed to $OUT"
+
+      - name: commit result
+        run: |
+          git config user.name "oodd-relay"
+          git config user.email "relay@users.noreply.github.com"
+          git add oodd/results/
+          git commit -m "oodd ${{ inputs.task }}: $(date -u +%FT%TZ) result" || echo "nothing to commit"
+          git push
+
+      - name: TG ping
+        env:
+          TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "TG secrets missing, skip ping"
+            exit 0
+          fi
+          curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$TG_CHAT" \
+            --data-urlencode "text=oodd-relay: task=${{ inputs.task }} 跑完咗, 結果見 repo oodd/results/" | head -c 200
+          echo
