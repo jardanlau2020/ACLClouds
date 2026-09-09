@@ -30,7 +30,9 @@ jobs:
 
       - name: 安装系统依赖 (xvfb 供浏览器 GUI 操作 + 中文字体)
         run: |
-          sudo apt-get update
+          # dl.google.com Chrome 源偶發 Hash Sum mismatch 會令 apt-get update 非零退出；
+          # xvfb/字体黎自 Ubuntu 源，Google 源壞唔影響，行 tolerate 得嘅 update
+          sudo apt-get update || sudo apt-get update || echo "⚠️ apt update 有部分源失敗，忽略（用舊索引繼續）"
           sudo apt-get install -y xvfb fonts-noto-cjk
           pip install -r requirements.txt
           seleniumbase install chromedriver || true
