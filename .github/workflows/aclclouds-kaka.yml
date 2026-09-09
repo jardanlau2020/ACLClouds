@@ -35,41 +35,11 @@ jobs:
           pip install -r requirements.txt
           seleniumbase install chromedriver || true
 
-      - name: 啟動本地 TUIC 代理橋 (sing-box)
+      - name: 設置住宅代理 (sing-box via NODE_LINK)
+        continue-on-error: true
         env:
-          TUIC_PROXY: ${{ secrets.TUIC_PROXY }}
-        run: |
-          set -e
-          if [ -z "$TUIC_PROXY" ]; then
-            echo "⚠️ 未設 TUIC_PROXY secret, 跳過代理橋 (續期將直連出街, 可能被 Cloudflare 擋)"
-            exit 0
-          fi
-          cd /tmp
-          curl -sL -o sb.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz
-          tar xzf sb.tar.gz
-          SB="sing-box-1.14.0-linux-amd64/sing-box"
-          chmod +x "$SB"
-          TUIC_PROXY="$TUIC_PROXY" python3 "$GITHUB_WORKSPACE/tuic_bridge.py" > /tmp/tuic.json
-          # 只印非敏感参数 (uuid 不入 log)
-          python3 -c "
-          import json
-          c=json.load(open('/tmp/tuic.json'))
-          o=c['outbounds'][0]
-          print('🔌 TUIC 橋:', o['server'], ':', o['server_port'], 'sni=', o['tls']['server_name'], 'alpn=', o['tls'].get('alpn'))
-          "
-          "$SB" run -c /tmp/tuic.json > /tmp/tuic.log 2>&1 &
-          echo $! > /tmp/tuic.pid
-          ok=""
-          for i in $(seq 1 30); do
-            IP=$(curl -s --max-time 6 -x http://127.0.0.1:10800 https://api.ipify.org 2>/dev/null || true)
-            if [ -n "$IP" ]; then ok=1; echo "✅ TUIC 橋已就緒, 代理出口 IP: $IP"; break; fi
-            sleep 1
-          done
-          if [ -z "$ok" ]; then
-            echo "❌ TUIC 橋 30s 未通, sing-box 日志:"
-            tail -20 /tmp/tuic.log
-            exit 1
-          fi
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: bash ./setup_proxy.sh
 
       - name: 执行续期
         env:
@@ -78,16 +48,19 @@ jobs:
           ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          TUIC_PROXY: ${{ secrets.TUIC_PROXY }}
           GH_REPO: ${{ secrets.GH_REPO }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         # xvfb-run 提供虚拟显示器, uc_gui_click_captcha 的 GUI 点击才能工作
         run: |
-          # TUIC 橋在位 -> 全鏈路走 10800 橋 (HTTP+SOCKS)
-          if [ -n "$TUIC_PROXY" ]; then
-            export IS_PROXY=true PROXY_SERVER=http://127.0.0.1:10800
+          # IS_PROXY/PROXY_SERVER 由 setup_proxy.sh 經 GITHUB_ENV 注入 (未配橋則直連)
+          if [ "$IS_PROXY" = "true" ]; then
+            echo "🔗 本次跑批走住宅代理: $PROXY_SERVER"
+            IP=$(curl -s --max-time 8 -x socks5://127.0.0.1:1080 https://api.ipify.org 2>/dev/null || true)
+            echo "🌍 代理出口 IP: ${IP:-取不到}"
+          else
+            echo "🌐 無代理, 直連 (數據中心 IP, Turnstile 可能會擋)"
           fi
           xvfb-run --auto-servernum python renew_fixed.py
 
