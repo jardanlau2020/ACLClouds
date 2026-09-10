@@ -67,6 +67,34 @@ RENEW_THRESHOLD_HOURS = float(os.environ.get("RENEW_THRESHOLD_HOURS", "48"))
 # 至少包含 XSRF-TOKEN 和 __Host-aclclouds_session
 COOKIE = os.environ.get("ACL_COOKIES", "").strip()
 
+# Cookie 缓存文件 (GitHub Actions cache 持久化, 每单跑批后刷新, 免人手换 cookie)
+# 有 actions/cache 时用缓存文件 (比 env/secret 的 cookie 更新); 冇缓存时落 ACL_COOKIES
+COOKIE_CACHE_FILE = os.environ.get("ACL_COOKIE_CACHE_FILE", "").strip()
+
+def _load_cookie_cache():
+    if COOKIE_CACHE_FILE and os.path.exists(COOKIE_CACHE_FILE):
+        try:
+            v = open(COOKIE_CACHE_FILE).read().strip()
+            if v:
+                print(f"📥 使用缓存 Cookie ({len(v)} 字符, 上一单写入)")
+                return v
+        except Exception:
+            pass
+    return ""
+
+def save_cookie_cache(cookie_str):
+    """把最新可用 Cookie 寫入緩存文件; 單尾 actions/cache 會把它持久化到 GitHub cache"""
+    if not COOKIE_CACHE_FILE or not (cookie_str or "").strip():
+        return
+    try:
+        with open(COOKIE_CACHE_FILE, "w") as f:
+            f.write(cookie_str.strip() + "\n")
+        log(f"💾 最新 Cookie 已寫入緩存文件 ({len(cookie_str.strip())} 字符)")
+    except Exception as e:
+        log(f"⚠️ Cookie 緩存文件寫入失敗: {e}")
+
+COOKIE = _load_cookie_cache() or COOKIE
+
 # 多账号支持 (可选), 格式: name1|||cookie1\nname2|||cookie2
 MULTI_ACCOUNTS = os.environ.get("ACL_ACCOUNTS", "").strip()
 
@@ -1604,6 +1632,7 @@ def main():
         if fresh:
             accounts = [("main", fresh)]
             log("✅ 浏览器登录成功, 使用新 Cookie 执行续期")
+            save_cookie_cache(fresh)
             if GH_TOKEN:
                 update_acl_secret(fresh)
         else:
@@ -1639,6 +1668,7 @@ def main():
                 if fresh:
                     log("✅ 浏览器登录成功, 用新 Cookie 重试续期")
                     res = process_account(label, fresh)
+                    save_cookie_cache(fresh)
                     if GH_TOKEN:
                         update_acl_secret(fresh)
                 else:

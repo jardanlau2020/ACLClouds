@@ -44,9 +44,18 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: bash ./setup_proxy.sh
 
+      - name: 📥 恢复 Cookie 缓存 (上一单写入的最新 cookie, API 直登; miss 属正常)
+        uses: actions/cache/restore@v4
+        with:
+          path: acl_cookie_cache.txt
+          key: aclcookie-latest
+          restore-keys: |
+            aclcookie-latest
+
       - name: 执行续期
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
+          ACL_COOKIE_CACHE_FILE: acl_cookie_cache.txt
           ACL_ACCOUNTS: ${{ secrets.ACL_ACCOUNTS }}
           ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
@@ -69,6 +78,13 @@ jobs:
             echo "🌐 無代理, 直連 (數據中心 IP, Turnstile 可能會擋)"
           fi
           xvfb-run --auto-servernum python renew_fixed.py
+
+      - name: 💾 保存 Cookie 缓存 (供下一单 API 直登, 免浏览器)
+        if: ${{ always() && hashFiles('acl_cookie_cache.txt') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: acl_cookie_cache.txt
+          key: aclcookie-latest
 
       - name: 📸 上传调试截图 (如有)
         if: always()
