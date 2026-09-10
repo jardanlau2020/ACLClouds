@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  secrets: write   # 允许 workflow 用内置 GITHUB_TOKEN 把新 Cookie 写回本仓 ACL_COOKIES secret
 
 # 防止上一次续期未完成时并发触发，避免重复 Renew。
 concurrency:
@@ -51,7 +52,9 @@ jobs:
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           GH_REPO: ${{ secrets.GH_REPO }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          # 用内置 GITHUB_TOKEN (workflow 已加 secrets:write) 回写本仓 ACL_COOKIES,
+          # 不再依赖用户 PAT (github_pat_11AOYSBG... 无 Actions:write, 会 401)。
+          GH_TOKEN: ${{ github.token }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         # xvfb-run 提供虚拟显示器, uc_gui_click_captcha 的 GUI 点击才能工作
