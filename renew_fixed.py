@@ -32,6 +32,31 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
+# OCR 引擎 (点选题卡片是图片, 需识别卡面文字; 参照 bo-aclclouds 方案)
+try:
+    import ddddocr
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+
+_ocr_engine = None
+if OCR_AVAILABLE:
+    try:
+        _ocr_engine = ddddocr.DdddOcr(show_ad=False)
+    except Exception:
+        _ocr_engine = None
+
+
+def _ocr_card_text(png_bytes):
+    """OCR 单张卡片截图, 返回识别文字 (失败返回空串)"""
+    if _ocr_engine is None:
+        return ""
+    try:
+        return (_ocr_engine.classification(png_bytes) or "").strip()
+    except Exception:
+        return ""
+
+
 # ==================== 配置 ====================
 # 改版后 API 直接由 aclclouds.com 提供; 不要再指到 dash.aclclouds.com
 # (dash 会 302 到主域, 重定向时 Cookie 会被 requests 丢弃导致 401)
@@ -471,22 +496,88 @@ def _dump_captcha_widget(sb, max_elems=80):
         log(f"   挑战 widget DOM dump 失败: {e}")
 
 
-def _challenge_card(sb):
-    """面板自定义挑战 'Click on X': 解析页面里 'Click on {词}' 的目标词,
-    在挑战盒 (锚点的祖先容器) 内点击同名卡片 (scratch 卡: VPS/Minecraft/Discord/Cloud)。
-
-    返回: True=点中卡片; False=页面无该挑战或没点中。
-    """
+def _challenge_card_ocr(sb, target):
+    """点选题卡片 OCR 策略 (参照 bo-aclclouds): 卡片是 img/canvas 图片, 文本匹配找不到,
+    逐张截图 OCR + difflib 模糊匹配目标词, 点最佳。得分 < 0.4 不盲点, 避免 'Captcha incorrect'。
+    返回: True=点中; False=无锚点/无卡片/得分不足/异常。"""
+    import difflib
+    d = sb.driver
     try:
-        sb.driver.switch_to.default_content()
-        pg = sb.get_page_source()
+        from selenium.webdriver.common.by import By
     except Exception:
         return False
-    m = re.search(r'[Cc]lick on\s+([A-Za-z]+)', pg)
-    if not m:
+    try:
+        # 1) 找最内层可见 'Click on' 锚点
+        anchor = None
+        for el in d.find_elements(By.XPATH, "//*[starts-with(normalize-space(text()),'Click on') or starts-with(normalize-space(text()),'click on')]"):
+            try:
+                if el.is_displayed():
+                    anchor = el
+                    break
+            except Exception:
+                continue
+        if anchor is None:
+            log("   ⚠️ OCR 卡策略: 无可见 'Click on' 锚点")
+            return False
+        # 2) 候选卡片: 锚点之后的 img/canvas (前 4) + role=dialog 内的 img/canvas
+        xpaths = [
+            "//*[contains(text(),'Click on') or contains(text(),'click on')]/following::canvas[position()<=4]",
+            "//*[contains(text(),'Click on') or contains(text(),'click on')]/following::img[position()<=4]",
+            "//div[contains(@role,'dialog')]//img",
+            "//div[contains(@role,'dialog')]//canvas",
+        ]
+        cards, seen = [], set()
+        for xp in xpaths:
+            try:
+                for c in d.find_elements(By.XPATH, xp):
+                    try:
+                        if not c.is_displayed():
+                            continue
+                        cid = c.id
+                    except Exception:
+                        continue
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    cards.append(c)
+                    if len(cards) >= 4:
+                        break
+            except Exception:
+                continue
+            if len(cards) >= 4:
+                break
+        if not cards:
+            log("   ⚠️ OCR 卡策略: 锚点附近无可见 img/canvas 卡片")
+            return False
+        # 3) 逐张 OCR + 模糊打分
+        best, best_score, best_text = None, 0.0, ""
+        for i, card in enumerate(cards):
+            ocr_text = _ocr_card_text(card.screenshot_as_png).lower()
+            score = difflib.SequenceMatcher(None, target, ocr_text).ratio()
+            if target in ocr_text or (len(ocr_text) >= 4 and ocr_text in target):
+                score = max(score, 0.85)
+            log(f"   🔍 OCR 卡片 #{i+1}: [{ocr_text}] 相似度 {score:.2f}")
+            if score > best_score:
+                best, best_score, best_text = card, score, ocr_text
+        if best is not None and best_score >= 0.4:
+            log(f"   ✨ 最佳卡片 [{best_text}] (得分 {best_score:.2f}), 点击中")
+            d.execute_script("arguments[0].scrollIntoView({block:'center'});", best)
+            time.sleep(0.3)
+            try:
+                best.click()
+            except Exception:
+                d.execute_script("arguments[0].click();", best)
+            return True
+        log(f"   ⚠️ OCR 卡策略: 最佳得分 {best_score:.2f} < 0.4, 不盲点")
         return False
-    target = m.group(1)
-    log(f"   🔣 自定义挑战: 需点击 '{target}' 卡片")
+    except Exception as e:
+        log(f"   ⚠️ OCR 卡策略异常: {e}")
+        return False
+
+
+def _challenge_card_text(sb, target):
+    """文本卡回退策略: 挑战盒 (锚点祖先容器) 内直接点同名文字卡片。
+    返回: True=点中; 'no-anchor'/'no-box'/'no-card'/False=原因。"""
     try:
         clicked = sb.driver.execute_script("""
             var t = arguments[0].toLowerCase();
@@ -541,11 +632,29 @@ def _challenge_card(sb):
     except Exception:
         clicked = False
     if clicked is True:
-        log(f"   ✅ 已点击 '{target}' 卡片 (挑战盒内)")
+        log(f"   ✅ 已点击 '{target}' 卡片 (文本卡)")
         return True
-    log(f"   ⚠️ '{target}' 卡片未点中 (原因: {clicked}), dump widget 结构排查...")
-    _dump_captcha_widget(sb)
+    log(f"   ⚠️ 文本卡未点中 (原因: {clicked})")
     return False
+
+
+def _challenge_card(sb):
+    """面板自定义挑战 'Click on X': 解析目标词, 先 OCR 卡片 (图片卡), 再回退文本卡。
+    返回: True=点中卡片; False=页面无该挑战或没点中。"""
+    try:
+        sb.driver.switch_to.default_content()
+        pg = sb.get_page_source()
+    except Exception:
+        return False
+    m = re.search(r'[Cc]lick on\s+([A-Za-z0-9_-]+)', pg)
+    if not m:
+        return False
+    target = m.group(1).strip().lower()
+    log(f"   🔣 自定义挑战: 需点击 '{target}' 卡片")
+    if not _challenge_card_ocr(sb, target):
+        _challenge_card_text(sb, target)
+    _dump_captcha_widget(sb)
+    return True
 
 
 def _discord_oauth_login(sb):
