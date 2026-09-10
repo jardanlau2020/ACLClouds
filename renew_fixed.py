@@ -1661,6 +1661,9 @@ def main():
     for label, ck in accounts:
         try:
             res = process_account(label, ck)
+            if res.get("ok"):
+                # API 登录成功 → 把当前可用 cookie 刷入缓存 (首单预热 + 保活)
+                save_cookie_cache(ck)
             # Cookie 登录 401 且有账密 → 浏览器自动登录重试 (免手动换 Cookie)
             if (not res.get("ok")) and ACL_EMAIL and ACL_PASSWORD and "401" in str(res.get("msg", "")):
                 log("🔑 Cookie 登录 401, 尝试浏览器自动登录重试...")
