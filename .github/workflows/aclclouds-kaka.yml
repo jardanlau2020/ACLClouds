@@ -52,10 +52,10 @@ jobs:
           ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           GH_REPO: ${{ secrets.GH_REPO }}
-          # 用內置 GITHUB_TOKEN 回寫 cookie: repo 已設 default workflow permissions =
-          # read_write (2026-09-10 API PATCH), 配合 workflow permissions: actions:write,
-          # gh secret set ACL_COOKIES 有權寫入。
-          GH_TOKEN: ${{ github.token }}
+          # 優先用倉庫 secret GH_TOKEN (需係有 Actions:write 嘅 fine-grained PAT); 未設/
+          # 空值時落後內置 GITHUB_TOKEN (fork 倉會 403, 唔阻塞)。兩者皆失敗都唔 fatal —
+          # 腳本會繼續用瀏覽器登入攞到嘅 in-memory cookie 完成續期。
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         # xvfb-run 提供虚拟显示器, uc_gui_click_captcha 的 GUI 点击才能工作
