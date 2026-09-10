@@ -8,7 +8,7 @@ on:
 
 permissions:
   contents: read
-  secrets: write   # 允许 workflow 用内置 GITHUB_TOKEN 把新 Cookie 写回本仓 ACL_COOKIES secret
+  actions: write   # 讓 GITHUB_TOKEN 可回寫本仓 ACL_COOKIES secret (Secrets API 歸 Actions 管)
 
 # 防止上一次续期未完成时并发触发，避免重复 Renew。
 concurrency:
