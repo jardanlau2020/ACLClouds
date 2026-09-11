@@ -1431,25 +1431,36 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                 log(f"   [Renew 後] 當前 URL: {cur_u[:90]}")
             except Exception:
                 pass
-            # 挑戰循環: widget 可能延遲 render, 每輪先 sleep 再偵測
+            # 深挖: iframe / modal / dialog / shadow DOM
             try:
-                for i in range(1, 6):
+                frames = driver.find_elements("css selector", "iframe")
+                log(f"   [iframes] {len(frames)} 個: {[ (f.get_attribute('src') or '')[:80] for f in frames ]}")
+            except Exception as e:
+                log(f"   [iframes] 異常: {e}")
+            try:
+                mods = driver.find_elements("css selector", "[class*=modal], [class*=dialog], [class*=overlay], [class*=popup], dialog, [role=dialog]")
+                log(f"   [modal/dialog] {len(mods)} 個")
+                for mi, m in enumerate(mods[:5]):
+                    try:
+                        if m.is_displayed():
+                            mt = (m.text or '').strip()[:150].replace("\n", " | ")
+                            log(f"   [modal {mi}] text: {mt}")
+                    except Exception:
+                        continue
+            except Exception as e:
+                log(f"   [modal] 異常: {e}")
+            # 挑戰循環: widget 可能延遲 render/藏 iframe, 每輪先 sleep 再偵測
+            try:
+                for i in range(1, 4):
                     sb.sleep(5)
                     try:
                         pg = sb.get_page_source().lower()
                     except Exception:
                         continue
                     has_clickon = bool(re.search(r"click on\s+[a-z]+", pg))
-                    has_widget = any(k in pg for k in ("confirmez", "challenge-card", "challenge_card", "verify", "vérifiez", "robot"))
+                    has_widget = ("confirmez" in pg) or ("challenge-card" in pg) or ("vérifiez" in pg)
                     log(f"   [挑戰偵測 {i}] click_on={has_clickon} widget={has_widget}")
                     if has_clickon or has_widget:
-                        # 截取 widget markup 定位
-                        try:
-                            idx = pg.find("confirmez") if "confirmez" in pg else pg.find("robot")
-                            if idx >= 0:
-                                log(f"   [widget 段] …{pg[max(0,idx-150):idx+250]}…".replace("\n"," ")[:500])
-                        except Exception:
-                            pass
                         _challenge_card(sb)
                         ok_ts = _click_turnstile(sb)
                         if ok_ts:
