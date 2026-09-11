@@ -1408,21 +1408,42 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
             # Renew 後狀態 dump + 截圖 (定位卡位)
             try:
                 dbg3 = []
-                for el in driver.find_elements("css selector", "a, button, [role='button']"):
+                for el in driver.find_elements("css selector", "a, button, [role='button'], div, span"):
                     try:
                         if el.is_displayed():
-                            dbg3.append((el.text or '').strip()[:28])
+                            t3 = (el.text or '').strip()
+                            if t3 and t3 not in dbg3:
+                                dbg3.append(t3[:28])
                     except Exception:
                         continue
-                log("   [debug] Renew 後可見按鈕: " + " | ".join(dbg3[:30]))
-            except Exception:
-                pass
+                log("   [debug] Renew 後可見元素: " + " | ".join(dbg3[:40]))
+            except Exception as e:
+                log(f"   [debug] dump 異常: {e}")
             try:
                 sb.save_screenshot("acl_after_renew.png")
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"   [debug] 截圖異常: {e}")
             sb.sleep(2)
-            # 5b) 攞 Turnstile token — 後端 renew 無論 XHR/API 都要求 cf-turnstile-response
+            # 5b) Renew 後偵測自製卡片挑戰 (後端 403 'Confirmez que vous n'êtes pas un robot'
+            #     對應登入同款 widget) → 重用 _challenge_card OCR 處理
+            try:
+                pg = sb.get_page_source().lower()
+                pending = bool(re.search(r"click on\s+[a-z]+", pg)) or ("robot" in pg) or ("challenge" in pg) or ("captcha" in pg)
+                log(f"   [挑戰偵測] pending={pending}")
+                if pending:
+                    for i in range(1, 6):
+                        _challenge_card(sb)
+                        ok_ts = _click_turnstile(sb)
+                        if ok_ts:
+                            log(f"   第 {i} 次處理挑戰/Turnstile...")
+                        sb.sleep(4)
+                        pg2 = sb.get_page_source().lower()
+                        if not (re.search(r"click on\s+[a-z]+", pg2) or ("robot" in pg2)):
+                            log("   ✅ 挑戰已過")
+                            break
+            except Exception as e:
+                log(f"   [挑戰偵測] 異常: {e}")
+            # 5c) 攞 Turnstile token — 後端 renew 無論 XHR/API 都要求 cf-turnstile-response
             token = None
             sitekey = None
             try:
@@ -1443,6 +1464,8 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                     if m:
                         sitekey = m.group(1)
                         log(f"   [turnstile] 由 render 調用段找到 sitekey: {sitekey}")
+                else:
+                    log("   [turnstile] 頁面冇 turnstile 引用 (後端或用自製挑戰, token 由挑戰流程發出)")
             except Exception as e:
                 log(f"   [turnstile] sitekey 探測異常: {e}")
             if sitekey:
