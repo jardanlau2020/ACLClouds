@@ -1451,23 +1451,36 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                 log(f"   [modal] 異常: {e}")
             # 撫 modal 內「I am not a robot」(自製 anti-bot checkbox, 唔係真 Turnstile)
             try:
-                for el in driver.find_elements("css selector", "button, [role='button'], label, span, div, input[type=checkbox]"):
+                clicked_robot = False
+                for el in driver.find_elements("css selector", "label, button, [role='checkbox'], [role='button'], span, div, input[type=checkbox]"):
                     try:
                         if not el.is_displayed():
                             continue
                         t = (el.text or "").strip().lower()
                         el_t = (el.get_attribute("type") or "").lower()
-                        if ("i am not a robot" in t or "not a robot" in t or "confirm you are human" in t
-                                or (el_t == "checkbox")):
-                            log(f"   撫 anti-bot checkbox: '{(el.text or el_t)[:40]}'")
+                        # 精準靶: text 恰好係 I am not a robot, 或真 checkbox
+                        if t in ("i am not a robot", "not a robot", "i'm not a robot") or el_t == "checkbox":
+                            log(f"   撫 anti-bot: tag={el.tag_name} type={el_t} text='{(el.text or el_t)[:40]}'")
                             try:
                                 el.click()
                             except Exception:
                                 driver.execute_script("arguments[0].click();", el)
+                            clicked_robot = True
                             sb.sleep(5)
                             break
                     except Exception:
                         continue
+                if not clicked_robot:
+                    log("   ⚠️ 搵唔到精準 robot checkbox")
+                # 撫後 dump modal 狀態 (睇挑戰/確認鈕)
+                try:
+                    mods = driver.find_elements("css selector", "[class*=modal], [role=dialog], dialog")
+                    for m in mods[:3]:
+                        if m.is_displayed():
+                            log(f"   [modal 後續] {(m.text or '')[:200]}".replace("\n", " | "))
+                except Exception:
+                    pass
+                sb.save_screenshot("acl_after_robot.png")
             except Exception as e:
                 log(f"   anti-bot checkbox 異常: {e}")
             # 撫後可能有第二層卡片挑戰 (click on X), 循環處理
@@ -1486,7 +1499,7 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                                 if not el.is_displayed():
                                     continue
                                 t = (el.text or "").strip().lower()
-                                if any(k in t for k in ("confirm", "validate", "valider", "confirmer", "renew", "prolonger")):
+                                if any(k in t for k in ("confirm", "validate", "valider", "confirmer", "renew", "prolonger")) and "renewing" not in t:
                                     log(f"   [第 {i} 輪] 撫 modal 確認: '{t[:30]}'")
                                     try:
                                         el.click()
