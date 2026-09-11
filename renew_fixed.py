@@ -1178,7 +1178,9 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                 "renouveler", "renouvel", "prolonger", "prolongation",
                 "续期", "续费", "延期")
     skip_kw = ("auto renew", "autorenew", "auto-renew", "auto-renouvel", "renewal status")
-    confirm_kw = ("confirm", "ok", "yes", "确认", "确定", "oui")
+    confirm_kw = ("confirm", "ok", "yes", "确认", "确定", "oui",
+                  "confirmer", "valider", "validate", "continuer", "continue", "submit",
+                  "prolonger", "extend", "renouveler")
 
     try:
         with SB(**kwargs) as sb:
@@ -1378,19 +1380,45 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                     pass
                 return None
             sb.sleep(2)
-            # 5) 确认对话框
-            try:
-                for el in driver.find_elements("css selector", "button, [role='button'], .btn"):
-                    try:
-                        if not el.is_displayed():
+            # 5) 确认对话框 (Renew 後可能彈確認/選時長 modal; 兩輪確認, JS click 兜底)
+            for round_i in range(1, 3):
+                confirmed = False
+                try:
+                    for el in driver.find_elements("css selector", "button, [role='button'], .btn"):
+                        try:
+                            if not el.is_displayed():
+                                continue
+                            t = (el.text or "").strip().lower()
+                            if any(k in t for k in confirm_kw):
+                                log(f"   点击确认 {round_i}: '{t[:30]}'")
+                                try:
+                                    el.click()
+                                except Exception:
+                                    log("   ⚠️ 确认原生 click 爆, 改 JS click")
+                                    driver.execute_script("arguments[0].click();", el)
+                                confirmed = True
+                                sb.sleep(3)
+                                break
+                        except Exception:
                             continue
-                        t = (el.text or "").strip().lower()
-                        if any(k in t for k in confirm_kw):
-                            el.click()
-                            log(f"   点击确认: '{t[:30]}'")
-                            break
+                except Exception:
+                    pass
+                if not confirmed:
+                    break
+            # Renew 後狀態 dump + 截圖 (定位卡位)
+            try:
+                dbg3 = []
+                for el in driver.find_elements("css selector", "a, button, [role='button']"):
+                    try:
+                        if el.is_displayed():
+                            dbg3.append((el.text or '').strip()[:28])
                     except Exception:
                         continue
+                log("   [debug] Renew 後可見按鈕: " + " | ".join(dbg3[:30]))
+            except Exception:
+                pass
+            try:
+                sb.save_screenshot("acl_after_renew.png")
             except Exception:
                 pass
             sb.sleep(2)
