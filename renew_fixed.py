@@ -1285,7 +1285,12 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                         t = txt.lower()
                         if any(k in t for k in renew_kw) and not any(k in t for k in skip_kw):
                             log(f"   找到续期按钮: '{txt[:40]}'")
-                            el.click()
+                            try:
+                                el.click()
+                            except Exception:
+                                # SPA re-render 令 element stale → JS click 兜底 (繞過攔截/失效)
+                                log("   ⚠️ 原生 click 爆 (可能 stale), 改 JS click")
+                                driver.execute_script("arguments[0].click();", el)
                             return True
                     except Exception:
                         continue
