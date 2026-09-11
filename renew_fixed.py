@@ -1422,6 +1422,31 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
             except Exception:
                 pass
             sb.sleep(2)
+            # 5b) 页面 context XHR 直接發 renew (瀏覽器指紋下 CF 對 XHR 通常唔擋;
+            #     SPA 內 fetch 自帶 session cookie + XSRF-TOKEN)
+            try:
+                res = driver.execute_async_script(
+                    """
+                    var cb = arguments[arguments.length - 1];
+                    var m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+                    var tok = m ? decodeURIComponent(m[1]) : '';
+                    fetch('/api/client/servers/%s/upgrade/renew', {
+                      method: 'POST',
+                      credentials: 'include',
+                      headers: {'Accept': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'X-XSRF-TOKEN': tok}
+                    }).then(function(r){
+                        return r.text().then(function(t){
+                            cb('HTTP ' + r.status + ' | ' + t.slice(0, 400));
+                        });
+                    }).catch(function(e){ cb('ERR ' + e); });
+                    """ % srv['id']
+                )
+                log(f"   [XHR renew] {res}")
+            except Exception as e:
+                log(f"   [XHR renew] 異常: {e}")
+            sb.sleep(3)
             # 6) 续期动作可能再弹人机验证 (CF Turnstile 或 'Click on X' 卡片), 循环处理直到无
             for i in range(1, 6):
                 pending = False
