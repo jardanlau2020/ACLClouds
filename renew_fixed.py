@@ -1208,8 +1208,8 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                 sb.open(BASE_URL + "/")
                 sb.wait_for_ready_state_complete()
                 sb.sleep(2)
-            # 3) 找服务器页: 先由 dashboard 按 server 名找 link (发现式, 适配自定义面板),
-            #    找不到再试 /servers/{短id} 直连
+            # 3) 找服务器页: 先由 dashboard 按 server 名/href 找 link (发现式, 适配自定义面板),
+            #    找不到再试多个候选直连路径
             page_ok = False
             srv_name_l = srv['name'].lower()
             for base in (BASE_URL + "/", BASE_URL + "/dashboard"):
@@ -1219,9 +1219,26 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                     sb.open(base)
                     sb.wait_for_ready_state_complete()
                     sb.sleep(3)
+                    # 调试: dump 全页可见连结 (text + href), 方便定位真实服务器页路径
+                    try:
+                        links_dbg = []
+                        for a in driver.find_elements("css selector", "a"):
+                            try:
+                                if a.is_displayed():
+                                    links_dbg.append(f"{(a.text or '').strip()[:30]} -> {(a.get_attribute('href') or '')[:80]}")
+                            except Exception:
+                                continue
+                        log("   [debug] 页面连结:\n     " + "\n     ".join(links_dbg[:40]))
+                    except Exception:
+                        pass
                     for a in driver.find_elements("css selector", "a"):
                         try:
-                            if a.is_displayed() and srv_name_l in (a.text or '').lower():
+                            if not a.is_displayed():
+                                continue
+                            txt_l = (a.text or '').lower()
+                            href_l = (a.get_attribute('href') or '').lower()
+                            # 按名称或 href 含 server id / 名称匹配
+                            if srv_name_l in txt_l or srv_name_l in href_l or srv['id'] in href_l or f"/servers/{srv['id']}" in href_l:
                                 a.click()
                                 sb.sleep(3)
                                 page_ok = True
@@ -1231,16 +1248,24 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                 except Exception as e:
                     log(f"   {base} 查找异常: {e}")
             if not page_ok:
-                log(f"   dashboard 未找到, 试 /servers/{srv['id']} 直连...")
-                try:
-                    sb.open(f"{BASE_URL}/servers/{srv['id']}")
-                    sb.wait_for_ready_state_complete()
-                    sb.sleep(3)
-                    body_txt = sb.get_text("body").lower()
-                    if srv_name_l in body_txt or f"/servers/{srv['id']}" in sb.get_current_url():
-                        page_ok = True
-                except Exception as e:
-                    log(f"   直连服务器页异常: {e}")
+                # 多候选直连路径 (适配不同面板路由)
+                for path in (f"/servers/{srv['id']}", f"/dashboard/servers/{srv['id']}",
+                             f"/server/{srv['id']}", f"/jeux/{srv['id']}", f"/servers"):
+                    if page_ok:
+                        break
+                    try:
+                        sb.open(BASE_URL + path)
+                        sb.wait_for_ready_state_complete()
+                        sb.sleep(3)
+                        body_txt = sb.get_text("body").lower()
+                        cur = sb.get_current_url()
+                        if srv_name_l in body_txt or srv['id'] in body_txt or f"{srv['id']}" in cur:
+                            log(f"   ✅ 直连命中: {path}")
+                            page_ok = True
+                        else:
+                            log(f"   直连未命中: {path} (当前 {cur[:70]})")
+                    except Exception as e:
+                        log(f"   直连 {path} 异常: {e}")
             if not page_ok:
                 log(f"❌ 浏览器 fallback 失败: 找不到服务器 {srv['name']} 的页面")
                 try:
