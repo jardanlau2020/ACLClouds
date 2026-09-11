@@ -1422,26 +1422,74 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
             except Exception:
                 pass
             sb.sleep(2)
-            # 5b) 页面 context XHR 直接發 renew (瀏覽器指紋下 CF 對 XHR 通常唔擋;
-            #     SPA 內 fetch 自帶 session cookie + XSRF-TOKEN)
+            # 5b) 攞 Turnstile token — 後端 renew 無論 XHR/API 都要求 cf-turnstile-response
+            token = None
+            sitekey = None
+            try:
+                html = driver.page_source
+                for m in re.finditer(r'data-sitekey="([^"]+)"', html):
+                    sitekey = m.group(1)
+                    break
+                if not sitekey:
+                    m = re.search(r'sitekey["\']?\s*[:=]\s*["\']([^"\']{10,})["\']', html)
+                    if m:
+                        sitekey = m.group(1)
+                if sitekey:
+                    log(f"   [turnstile] sitekey: {sitekey}")
+                elif 'turnstile' in html.lower():
+                    log("   [turnstile] 頁面有 turnstile 引用但未找到 sitekey")
+                    # turnstile.render 調用段搵 sitekey
+                    m = re.search(r'turnstile\.render\([^)]*["\']([^"\']{10,})["\']', html)
+                    if m:
+                        sitekey = m.group(1)
+                        log(f"   [turnstile] 由 render 調用段找到 sitekey: {sitekey}")
+            except Exception as e:
+                log(f"   [turnstile] sitekey 探測異常: {e}")
+            if sitekey:
+                try:
+                    token = driver.execute_async_script(
+                        """
+                        var sitekey = arguments[0];
+                        var cb = arguments[arguments.length - 1];
+                        var el = document.createElement('div');
+                        el.id = 'renew-turnstile';
+                        document.body.appendChild(el);
+                        try {
+                          turnstile.render(el, {sitekey: sitekey, callback: function(t){ cb(t); }});
+                        } catch(e) { cb('ERR ' + e); }
+                        """,
+                        sitekey,
+                    )
+                    if token and not token.startswith('ERR'):
+                        log(f"   [turnstile] token: {token[:60]}…")
+                    else:
+                        log(f"   [turnstile] token: {token}")
+                        token = None
+                except Exception as e:
+                    log(f"   [turnstile] token 攞取異常: {e}")
+            # 5c) 页面 context XHR 直接發 renew (有 token 帶 token,無 token 照發記錄後端回應)
             try:
                 res = driver.execute_async_script(
                     """
                     var cb = arguments[arguments.length - 1];
+                    var token = arguments[0];
                     var m = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
                     var tok = m ? decodeURIComponent(m[1]) : '';
+                    var hdrs = {'Accept': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'X-XSRF-TOKEN': tok};
+                    if (token) { hdrs['cf-turnstile-response'] = token; }
                     fetch('/api/client/servers/%s/upgrade/renew', {
                       method: 'POST',
                       credentials: 'include',
-                      headers: {'Accept': 'application/json',
-                                'X-Requested-With': 'XMLHttpRequest',
-                                'X-XSRF-TOKEN': tok}
+                      headers: hdrs
                     }).then(function(r){
                         return r.text().then(function(t){
                             cb('HTTP ' + r.status + ' | ' + t.slice(0, 400));
                         });
                     }).catch(function(e){ cb('ERR ' + e); });
-                    """ % srv['id']
+                    """ % srv['id'],
+                    token,
                 )
                 log(f"   [XHR renew] {res}")
             except Exception as e:
