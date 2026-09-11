@@ -1293,6 +1293,54 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
 
             clicked = _find_and_click_renew()
             if not clicked:
+                # 调试: dump 服务器页全部连结+按钮 (text+href), 定位 renew 真实位置
+                try:
+                    dbg = []
+                    for el in driver.find_elements("css selector", "a, button, [role='button']"):
+                        try:
+                            if el.is_displayed():
+                                dbg.append(f"{(el.text or '').strip()[:30]} -> {(el.get_attribute('href') or '')[:70]}")
+                        except Exception:
+                            continue
+                    log("   [debug] 服务器页元素:\n     " + "\n     ".join(dbg[:50]))
+                except Exception:
+                    pass
+                # 服务器页概要页: 试点 'Ouvrir mon panel' (开 panel) 再找 renew
+                try:
+                    for b in driver.find_elements("css selector", "button, a, [role='button']"):
+                        try:
+                            t = (b.text or "").strip().lower()
+                            if b.is_displayed() and ("ouvrir mon panel" in t or "open my panel" in t or "mon panel" in t):
+                                log(f"   撳 '{(b.text or '').strip()[:40]}' 入 panel...")
+                                old_handles = set(driver.window_handles)
+                                b.click()
+                                sb.sleep(4)
+                                # 可能开新 tab, 切过去
+                                new_h = [h for h in driver.window_handles if h not in old_handles]
+                                if new_h:
+                                    driver.switch_to.window(new_h[0])
+                                    log(f"   切入新 tab: {sb.get_current_url()[:80]}")
+                                sb.sleep(3)
+                                # panel 界面再 dump 一次
+                                try:
+                                    dbg2 = []
+                                    for el in driver.find_elements("css selector", "a, button, [role='button']"):
+                                        try:
+                                            if el.is_displayed():
+                                                dbg2.append(f"{(el.text or '').strip()[:30]} -> {(el.get_attribute('href') or '')[:70]}")
+                                        except Exception:
+                                            continue
+                                    log("   [debug] panel 页元素:\n     " + "\n     ".join(dbg2[:50]))
+                                except Exception:
+                                    pass
+                                clicked = _find_and_click_renew()
+                                if clicked:
+                                    break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    log(f"   panel 撳钮异常: {e}")
+            if not clicked:
                 tab_kw = ("billing", "renew", "facturation", "extension",
                           "abonnement", "paiement", "payment", "续期", "计费", "账单")
                 for a in driver.find_elements("css selector", "a, [role='tab'], .tab, .nav-link"):
