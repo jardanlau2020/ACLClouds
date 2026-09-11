@@ -2,8 +2,9 @@ name: AclClouds-卡卡自动续期
 
 on:
   schedule:
-    # 每 6 小时检查一次（GitHub Actions 可能延迟，但比每日一次更抗漏跑）
-    - cron: "0 */6 * * *"
+    # 每 2 小时检查一次：Laravel session 壽命 2~8 小時，加密頻率趕在過期前刷新 cookie，
+    # 盡量避免走到 401 → 瀏覽器 fallback（機房 IP 過唔到 Turnstile）嘅死路
+    - cron: "0 */2 * * *"
   workflow_dispatch: {}
 
 permissions:
