@@ -1424,23 +1424,39 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
             except Exception as e:
                 log(f"   [debug] 截圖異常: {e}")
             sb.sleep(2)
-            # 5b) Renew 後偵測自製卡片挑戰 (後端 403 'Confirmez que vous n'êtes pas un robot'
-            #     對應登入同款 widget) → 重用 _challenge_card OCR 處理
+            # 5b) Renew 後等 SPA re-render (撳完即刻 dump 會見白屏 loading)
+            sb.sleep(8)
             try:
-                pg = sb.get_page_source().lower()
-                pending = bool(re.search(r"click on\s+[a-z]+", pg)) or ("robot" in pg) or ("challenge" in pg) or ("captcha" in pg)
-                log(f"   [挑戰偵測] pending={pending}")
-                if pending:
-                    for i in range(1, 6):
+                cur_u = sb.get_current_url()
+                log(f"   [Renew 後] 當前 URL: {cur_u[:90]}")
+            except Exception:
+                pass
+            # 挑戰循環: widget 可能延遲 render, 每輪先 sleep 再偵測
+            try:
+                for i in range(1, 6):
+                    sb.sleep(5)
+                    try:
+                        pg = sb.get_page_source().lower()
+                    except Exception:
+                        continue
+                    has_clickon = bool(re.search(r"click on\s+[a-z]+", pg))
+                    has_widget = any(k in pg for k in ("confirmez", "challenge-card", "challenge_card", "verify", "vérifiez", "robot"))
+                    log(f"   [挑戰偵測 {i}] click_on={has_clickon} widget={has_widget}")
+                    if has_clickon or has_widget:
+                        # 截取 widget markup 定位
+                        try:
+                            idx = pg.find("confirmez") if "confirmez" in pg else pg.find("robot")
+                            if idx >= 0:
+                                log(f"   [widget 段] …{pg[max(0,idx-150):idx+250]}…".replace("\n"," ")[:500])
+                        except Exception:
+                            pass
                         _challenge_card(sb)
                         ok_ts = _click_turnstile(sb)
                         if ok_ts:
-                            log(f"   第 {i} 次處理挑戰/Turnstile...")
-                        sb.sleep(4)
-                        pg2 = sb.get_page_source().lower()
-                        if not (re.search(r"click on\s+[a-z]+", pg2) or ("robot" in pg2)):
-                            log("   ✅ 挑戰已過")
-                            break
+                            log(f"   第 {i} 次處理挑戰/Turnstile 完成")
+                    else:
+                        log(f"   ✅ 第 {i} 輪冇挑戰殘留")
+                        break
             except Exception as e:
                 log(f"   [挑戰偵測] 異常: {e}")
             # 5c) 攞 Turnstile token — 後端 renew 無論 XHR/API 都要求 cf-turnstile-response
