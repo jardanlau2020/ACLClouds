@@ -1449,6 +1449,60 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
                         continue
             except Exception as e:
                 log(f"   [modal] 異常: {e}")
+            # 撫 modal 內「I am not a robot」(自製 anti-bot checkbox, 唔係真 Turnstile)
+            try:
+                for el in driver.find_elements("css selector", "button, [role='button'], label, span, div, input[type=checkbox]"):
+                    try:
+                        if not el.is_displayed():
+                            continue
+                        t = (el.text or "").strip().lower()
+                        el_t = (el.get_attribute("type") or "").lower()
+                        if ("i am not a robot" in t or "not a robot" in t or "confirm you are human" in t
+                                or (el_t == "checkbox")):
+                            log(f"   撫 anti-bot checkbox: '{(el.text or el_t)[:40]}'")
+                            try:
+                                el.click()
+                            except Exception:
+                                driver.execute_script("arguments[0].click();", el)
+                            sb.sleep(5)
+                            break
+                    except Exception:
+                        continue
+            except Exception as e:
+                log(f"   anti-bot checkbox 異常: {e}")
+            # 撫後可能有第二層卡片挑戰 (click on X), 循環處理
+            try:
+                for i in range(1, 6):
+                    pg = sb.get_page_source().lower()
+                    has_clickon = bool(re.search(r"click on\s+[a-z]+", pg))
+                    if has_clickon:
+                        log(f"   [第 {i} 輪] 卡片挑戰出現, OCR 處理...")
+                        _challenge_card(sb)
+                        sb.sleep(4)
+                    else:
+                        # modal 內 confirm/validate 若存在則撫
+                        for el in driver.find_elements("css selector", "button, [role='button']"):
+                            try:
+                                if not el.is_displayed():
+                                    continue
+                                t = (el.text or "").strip().lower()
+                                if any(k in t for k in ("confirm", "validate", "valider", "confirmer", "renew", "prolonger")):
+                                    log(f"   [第 {i} 輪] 撫 modal 確認: '{t[:30]}'")
+                                    try:
+                                        el.click()
+                                    except Exception:
+                                        driver.execute_script("arguments[0].click();", el)
+                                    sb.sleep(4)
+                                    break
+                            except Exception:
+                                continue
+                        pg2 = sb.get_page_source().lower()
+                        if not re.search(r"click on\s+[a-z]+", pg2):
+                            log(f"   ✅ 第 {i} 輪 modal 挑戰已清")
+                            break
+            except Exception as e:
+                log(f"   modal 挑戰處理異常: {e}")
+            sb.sleep(2)
             # 挑戰循環: widget 可能延遲 render/藏 iframe, 每輪先 sleep 再偵測
             try:
                 for i in range(1, 4):
