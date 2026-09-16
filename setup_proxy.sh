@@ -17,7 +17,19 @@ if ! command -v jq &> /dev/null; then
   sudo apt-get update && sudo apt-get install -y jq
 fi
 
-command -v curl &>/dev/null && COMMAND="curl -so" || command -v wget &>/dev/null && COMMAND="wget -qO" || { red "Error: neither curl nor wget found, please install one of them." >&2; exit 1; }
+# 晴天 patch：原寫法 `A && B || C && D` 優先級錯誤（curl 存在時都會選 wget）且 curl 缺 -L 跟 redirect
+if command -v curl >/dev/null 2>&1; then
+  COMMAND="curl -sLo"
+elif command -v wget >/dev/null 2>&1; then
+  COMMAND="wget -qO"
+else
+  echo "Error: neither curl nor wget found." >&2; exit 1
+fi
+
+# 晴天 patch：CWD 已有可用 sing-box 就跳過下載（GHA runner 首跑必無，照舊下載）
+if [ -x ./sing-box ] && ./sing-box version >/dev/null 2>&1; then
+  echo "[INFO] 檢測到本地 sing-box，跳過下載"
+else
 
 echo "[INFO] 获取 sing-box 最新版本..."
 latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
@@ -53,6 +65,8 @@ mv "sing-box-${download_version}-linux-${ARCH}/sing-box" ./
 rm -f "sing-box-${download_version}-linux-${ARCH}.tar.gz"
 rm -rf "sing-box-${download_version}-linux-${ARCH}"
 chmod +x sing-box
+
+fi  # 晴天 patch：本地已有 sing-box 跳過下載
 
 proto=$(echo "$NODE_LINK" | cut -d':' -f1)
 content="${NODE_LINK#*://}"
@@ -319,6 +333,34 @@ case "$proto" in
     [ -z "$outbound_sni" ] && outbound_sni="$outbound_server"
     ;;
 
+  ss)
+    # SIP002: ss://base64(method:password)@host:port#tag（晴天 patch：支援 shadowsocks 家寬節點）
+    userinfo_host="${content%%@*}"
+    rest="${content#*@}"
+    if [[ "$rest" == *"?"* ]]; then
+      host_port="${rest%%\?*}"
+      query="${rest#*\?}"
+    else
+      host_port="$rest"
+      query=""
+    fi
+    host_port="${host_port%%#*}"
+    decoded=$(echo "$userinfo_host" | base64 -d 2>/dev/null || true)
+    if [[ "$decoded" == *":"* ]]; then
+      outbound_username="${decoded%%:*}"
+      outbound_password2="${decoded#*:}"
+    else
+      # 舊格式：整條 link base64
+      full_decoded=$(echo "$content" | base64 -d 2>/dev/null || true)
+      meth_pass="${full_decoded%%@*}"
+      outbound_username="${meth_pass%%:*}"
+      outbound_password2="${meth_pass#*:}"
+    fi
+    outbound_server="${host_port%:*}"
+    outbound_port="${host_port#*:}"
+    outbound_type="shadowsocks"
+    ;;
+
   socks5|socks)
     if [[ "$content" == *"@"* ]]; then
       user_pass="${content%%@*}"
@@ -406,6 +448,10 @@ case "$outbound_type" in
     jq_outbound="$jq_outbound,\"password\":\"$outbound_password\""
     jq_outbound="$jq_outbound,\"tls\":{\"enabled\":true,\"server_name\":\"$outbound_sni\",\"insecure\":$outbound_insecure,\"utls\":{\"enabled\":true,\"fingerprint\":\"$outbound_fingerprint\"}}"
     ;;
+  shadowsocks)
+    jq_outbound="$jq_outbound,\"method\":\"$outbound_username\",\"password\":\"$outbound_password2\""
+    ;;
+
   socks)
     [ -n "$outbound_username" ] && jq_outbound="$jq_outbound,\"username\":\"$outbound_username\""
     [ -n "$outbound_password2" ] && jq_outbound="$jq_outbound,\"password\":\"$outbound_password2\""
