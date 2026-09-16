@@ -396,11 +396,14 @@ def renewal_availability(attrs, detail=None):
     return None, None, None
 
 
-def solve_captcha_api(session, context="renewal_gate", max_rounds=4):
+def solve_captcha_api(session, context="renewal_gate", max_rounds=6):
     """純 API 解 ACLClouds 自家 anti-bot 驗證 (由前端 6893.js 反編譯還原協議):
     1. GET /auth/captcha/challenge?context=X -> {id, ts, sig, context}
     2. POST /auth/captcha {context, id, ts, sig, elapsed} -> {passed, token}
        或 {passed:false, interactive:true, options:[token...], target, answer_sig}
+       ⚠️ interactive 回應會帶「刷新後」嘅 {id, ts, sig}: 之後所有提交必須用新值。
+       用最初 GET 嘅舊 id/sig 交答案, 後端一律靜默拒絕 (只會再出新題) —
+       09-16 本地對照實驗實錘 (C2: 4/4 正確答案全拒; A: 刷新後第 1 輪即過)。
     3. 卡片挑戰: 每張卡圖 GET /auth/captcha/image?t=<option> (OCR) -> 提交 answer=<option 原文>
     成功返回 captcha_token; 失敗返回 None。機房 IP 亦可用 (驗證係應用層, 非互動 CAPTCHA 繞過)。"""
     try:
@@ -435,6 +438,11 @@ def solve_captcha_api(session, context="renewal_gate", max_rounds=4):
         if not (a.get("interactive") and opts):
             log(f"   [captcha] 後端唔畀過: {str(a)[:180]}")
             return None
+        # 前端 (6893.js) 以 interactive 回應嘅新 id/sig 替換 challenge state 再交答案;
+        # 後端只認「刷新後」嘅 id — 用最初 GET 嘅舊 id/sig 會被靜默拒絕, 無限重新出題
+        if a.get("id") and a.get("sig"):
+            base = {"context": a.get("context") or base.get("context"),
+                    "id": a["id"], "ts": a.get("ts") or base.get("ts"), "sig": a["sig"]}
         target = (a.get("target") or "").strip()
         asig = a.get("answer_sig") or ""
         log(f"   [captcha] 第 {rnd} 輪卡片挑戰: 目標 '{target}' / {len(opts)} 張卡")
@@ -464,6 +472,10 @@ def solve_captcha_api(session, context="renewal_gate", max_rounds=4):
         if b.get("passed") and b.get("token"):
             log(f"   [captcha] ✅ 第 {rnd} 輪卡片過關, captcha_token 已到手")
             return b["token"]
+        # 答案被拒後同樣以回應嘅新 id/sig 續題 (與前端 b.current 更新一致)
+        if b.get("id") and b.get("sig"):
+            base = {"context": b.get("context") or base.get("context"),
+                    "id": b["id"], "ts": b.get("ts") or base.get("ts"), "sig": b["sig"]}
         if not b.get("interactive"):
             log(f"   [captcha] 卡片後仍唔過: {str(b)[:180]}")
             return None
