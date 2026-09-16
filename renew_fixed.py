@@ -27,6 +27,7 @@ import sys
 import json
 import time
 import re
+import random
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 
@@ -395,8 +396,85 @@ def renewal_availability(attrs, detail=None):
     return None, None, None
 
 
+def solve_captcha_api(session, context="renewal_gate", max_rounds=4):
+    """純 API 解 ACLClouds 自家 anti-bot 驗證 (由前端 6893.js 反編譯還原協議):
+    1. GET /auth/captcha/challenge?context=X -> {id, ts, sig, context}
+    2. POST /auth/captcha {context, id, ts, sig, elapsed} -> {passed, token}
+       或 {passed:false, interactive:true, options:[token...], target, answer_sig}
+    3. 卡片挑戰: 每張卡圖 GET /auth/captcha/image?t=<option> (OCR) -> 提交 answer=<option 原文>
+    成功返回 captcha_token; 失敗返回 None。機房 IP 亦可用 (驗證係應用層, 非互動 CAPTCHA 繞過)。"""
+    try:
+        ch = api_get(session, f"/auth/captcha/challenge?context={context}")
+    except Exception as e:
+        log(f"   [captcha] challenge 異常: {e}")
+        return None
+    if ch.status_code != 200:
+        log(f"   [captcha] challenge GET HTTP {ch.status_code}: {ch.text[:120]}")
+        return None
+    try:
+        c = ch.json()
+    except Exception:
+        log(f"   [captcha] challenge 響應唔係 JSON: {ch.text[:120]}")
+        return None
+    base = {"context": c.get("context") or context,
+            "id": c.get("id"), "ts": c.get("ts"), "sig": c.get("sig")}
+    if not base.get("id") or not base.get("sig"):
+        log(f"   [captcha] challenge 缺 id/sig: {str(c)[:160]}")
+        return None
+    for rnd in range(1, max_rounds + 1):
+        try:
+            r = api_post(session, "/auth/captcha", dict(base, elapsed=random.randint(1800, 9000)))
+            a = r.json()
+        except Exception as e:
+            log(f"   [captcha] 第 {rnd} 輪提交異常: {e}")
+            return None
+        if a.get("passed") and a.get("token"):
+            log(f"   [captcha] ✅ 第 {rnd} 輪驗證通過, captcha_token 已到手")
+            return a["token"]
+        opts = a.get("options")
+        if not (a.get("interactive") and opts):
+            log(f"   [captcha] 後端唔畀過: {str(a)[:180]}")
+            return None
+        target = (a.get("target") or "").strip()
+        asig = a.get("answer_sig") or ""
+        log(f"   [captcha] 第 {rnd} 輪卡片挑戰: 目標 '{target}' / {len(opts)} 張卡")
+        best = None
+        tl = target.lower()
+        for i, op in enumerate(opts):
+            try:
+                img_r = api_get(session, f"/auth/captcha/image?t={urllib.parse.quote(op)}")
+                txt = _ocr_card_text(img_r.content) if img_r.status_code == 200 else ""
+                log(f"   [captcha]   卡{i}: OCR='{txt}'")
+                lo = txt.lower()
+                if tl and (tl in lo or (lo and lo in tl)):
+                    best = op
+                    break
+            except Exception as e:
+                log(f"   [captcha]   卡{i} OCR 異常: {e}")
+        if best is None:
+            log("   [captcha] OCR 冇中目標, 隨機揀卡博一輪")
+            best = random.choice(opts)
+        try:
+            r2 = api_post(session, "/auth/captcha",
+                          dict(base, answer=best, answer_sig=asig, target=target))
+            b = r2.json()
+        except Exception as e:
+            log(f"   [captcha] 卡片提交異常: {e}")
+            return None
+        if b.get("passed") and b.get("token"):
+            log(f"   [captcha] ✅ 第 {rnd} 輪卡片過關, captcha_token 已到手")
+            return b["token"]
+        if not b.get("interactive"):
+            log(f"   [captcha] 卡片後仍唔過: {str(b)[:180]}")
+            return None
+    log("   [captcha] 多輪未解, 放棄純 API 驗證")
+    return None
+
+
 def renew_server_api(session, sid):
-    """调用续期接口 (路由已确认仍存在)"""
+    """调用续期接口 (路由已确认仍存在)。
+    403 captcha_required 時走純 API 自家驗證 (solve_captcha_api) 後帶 token 重發;
+    純 API 解唔開先交還 caller 行瀏覽器 fallback。"""
     r = api_post(session, f"/api/client/servers/{sid}/upgrade/renew")
     captcha_required = False
     if r.status_code == 403:
@@ -409,6 +487,18 @@ def renew_server_api(session, sid):
         except Exception:
             if "captcha" in body.lower():
                 captcha_required = True
+        if captcha_required:
+            log("🧩 續期接口要 anti-bot 驗證, 走純 API renewal_gate 流程 (唔使瀏覽器)...")
+            tok = solve_captcha_api(session, "renewal_gate")
+            if tok:
+                r2 = api_post(session, f"/api/client/servers/{sid}/upgrade/renew",
+                              {"captcha_token": tok})
+                log(f"   [renew] 帶 token 重發 -> HTTP {r2.status_code} | {r2.text[:120]}")
+                if r2.status_code not in (403,) or "captcha" not in r2.text.lower():
+                    return r2, False
+                log("   [renew] 帶 token 仍被攔, 交瀏覽器 fallback")
+            else:
+                log("   [renew] 純 API 驗證未過, 交瀏覽器 fallback")
     return r, captcha_required
 
 
@@ -1804,7 +1894,7 @@ def process_account(label, cookie_str):
                 failed += 1
                 break
             elif r.status_code == 403 and captcha:
-                log(f"🛡️ API 续期被 Cloudflare 风控拦截 (需要 Turnstile), 切浏览器 fallback...")
+                log(f"🛡️ 純 API anti-bot 驗證未過, 切瀏覽器 fallback...")
                 new_rem = renew_via_browser(srv, cookie_str, session, srv["remaining"])
                 if new_rem is not None:
                     results.append(f"✅ {srv['name']}: API 被 Turnstile 拦截, 浏览器 fallback 续期成功 "
