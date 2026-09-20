@@ -94,7 +94,12 @@ def save_cookie_cache(cookie_str):
     except Exception as e:
         log(f"⚠️ Cookie 緩存文件寫入失敗: {e}")
 
-COOKIE = _load_cookie_cache() or COOKIE
+# 2026-09-20 修正：緩存文件未必最新 —— actions/cache 用固定 key 時 save 永遠失敗
+# （"Unable to reserve cache with key aclcookie-latest"），所以還原到嘅緩存可能係化石，
+# 而 secret ACL_COOKIES 反而係上一單新鮮寫入嘅。兩個來源都留住，401 時依次序再試。
+CACHE_COOKIE = _load_cookie_cache()
+ENV_COOKIE = COOKIE
+COOKIE = CACHE_COOKIE or ENV_COOKIE
 
 # 多账号支持 (可选), 格式: name1|||cookie1\nname2|||cookie2
 MULTI_ACCOUNTS = os.environ.get("ACL_ACCOUNTS", "").strip()
@@ -1136,6 +1141,29 @@ def _browser_do_login(sb):
     return _submit_and_wait()
 
 
+def captcha_image_health():
+    """探測面板 captcha 圖服務 (非入侵, 唔做任何帳號操作), 回一句人話描述。"""
+    try:
+        s = build_api_session("")
+        ch = api_get(s, "/auth/captcha/challenge?context=login")
+        if ch.status_code != 200:
+            return f"challenge HTTP {ch.status_code}"
+        c = ch.json()
+        base = {k: c[k] for k in ("id", "ts", "sig") if k in c}
+        base["context"] = "login"
+        r = api_post(s, "/auth/captcha", dict(base, elapsed=random.randint(1800, 9000)))
+        d = r.json() if r.status_code == 200 else {}
+        opts = d.get("options") or []
+        if not opts:
+            return "challenge 無卡片選項 (可能已直接通過)"
+        ir = api_get(s, f"/auth/captcha/image?t={urllib.parse.quote(opts[0])}")
+        if ir.status_code == 200 and len(ir.content) > 1000:
+            return "OK (圖服務正常)"
+        return f"面板側故障 HTTP {ir.status_code} (ACLClouds 自己嘅 /auth/captcha/image 掛咗, 非本端問題)"
+    except Exception as e:
+        return f"探測失敗: {e}"
+
+
 def browser_login():
     """用浏览器登录 aclclouds.com, 返回 Cookie 字符串; 失败返回 None
 
@@ -2062,18 +2090,30 @@ def main():
             if res.get("ok"):
                 # API 登录成功 → 把当前可用 cookie 刷入缓存 (首单预热 + 保活)
                 save_cookie_cache(ck)
-            # Cookie 登录 401 且有账密 → 浏览器自动登录重试 (免手动换 Cookie)
-            if (not res.get("ok")) and ACL_EMAIL and ACL_PASSWORD and "401" in str(res.get("msg", "")):
-                log("🔑 Cookie 登录 401, 尝试浏览器自动登录重试...")
-                fresh = browser_login()
-                if fresh:
-                    log("✅ 浏览器登录成功, 用新 Cookie 重试续期")
-                    res = process_account(label, fresh)
-                    save_cookie_cache(fresh)
-                    if GH_TOKEN:
-                        update_acl_secret(fresh)
-                else:
-                    log("⚠️ 浏览器登录失败, 维持 401 结果")
+            # Cookie 登录 401 → 先試 secret 嘅 cookie, 再瀏覽器自動登录 (免手动换 Cookie)
+            if (not res.get("ok")) and "401" in str(res.get("msg", "")):
+                if ENV_COOKIE and ENV_COOKIE != ck:
+                    log("🔁 緩存 Cookie 401 → 改用 ACL_COOKIES secret 嘅 Cookie 重試…")
+                    res2 = process_account(label, ENV_COOKIE)
+                    if res2.get("ok"):
+                        res = res2
+                        save_cookie_cache(ENV_COOKIE)
+                    else:
+                        log("   secret Cookie 同樣 401")
+                if (not res.get("ok")) and ACL_EMAIL and ACL_PASSWORD:
+                    log("🔑 Cookie 登录 401, 尝试浏览器自动登录重试...")
+                    fresh = browser_login()
+                    if fresh:
+                        log("✅ 浏览器登录成功, 用新 Cookie 重试续期")
+                        res = process_account(label, fresh)
+                        save_cookie_cache(fresh)
+                        if GH_TOKEN:
+                            update_acl_secret(fresh)
+                    else:
+                        health = captcha_image_health()
+                        log(f"⚠️ 浏览器登录失败, 维持 401 结果")
+                        log(f"🧩 captcha 圖服務探測: {health}")
+                        res["msg"] = f"{res.get('msg', '')}；瀏覽器登入亦失敗 (captcha 圖服務: {health})"
         except Exception as e:
             res = {"label": label, "ok": False, "msg": f"异常: {e}", "renewed": 0, "failed": 1}
         all_results.append(res)

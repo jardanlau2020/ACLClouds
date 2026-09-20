@@ -49,9 +49,11 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: acl_cookie_cache.txt
-          key: aclcookie-latest
+          # 2026-09-20 改：固定 key 令 save 永遠撞 "Unable to reserve cache"（同一 key 唔可以覆寫），
+          # 結果還原到嘅係最舊嗰份化石 cookie、每單都 401 再燒瀏覽器登入。改輪換 key + 前綴 restore。
+          key: aclcookie-${{ github.run_id }}
           restore-keys: |
-            aclcookie-latest
+            aclcookie-
 
       - name: 执行续期
         env:
@@ -85,7 +87,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: acl_cookie_cache.txt
-          key: aclcookie-latest
+          key: aclcookie-${{ github.run_id }}
 
       - name: 📸 上传调试截图 (如有)
         if: always()
