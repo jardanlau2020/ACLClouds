@@ -1,0 +1,29 @@
+name: PROBE-ACLLogin（一次性探針，用完可刪）
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装 requests
+        run: pip install -q requests
+
+      - name: 跑探針（純 API 登入可行性）
+        env:
+          ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
+          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+        run: python probe_acl_login.py
