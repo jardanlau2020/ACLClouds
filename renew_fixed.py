@@ -1142,24 +1142,41 @@ def _browser_do_login(sb):
 
 
 def captcha_image_health():
-    """探測面板 captcha 圖服務 (非入侵, 唔做任何帳號操作), 回一句人話描述。"""
+    """探測面板 captcha 服務 (非入侵, 唔做任何帳號操作), 回一句人話描述。
+
+    2026-09-20 加：當日登入失敗根因唔一定喺本端 —— 實測 /auth/captcha/image 回 500
+    （NAS + GHA runner 兩邊、login 兩個 context 都係），登入頁卡片圖全空白、
+    OCR 無卡可讀，submit 即 "Captcha incorrect."。此探測令 TG 講清楚係面板側故障。
+    """
     try:
-        s = build_api_session("")
-        ch = api_get(s, "/auth/captcha/challenge?context=login")
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA, "Accept": "application/json",
+                          "Origin": BASE_URL, "Referer": f"{BASE_URL}/auth/login",
+                          "X-Requested-With": "XMLHttpRequest"})
+        ch = s.get(f"{BASE_URL}/auth/captcha/challenge?context=login", timeout=30)
         if ch.status_code != 200:
             return f"challenge HTTP {ch.status_code}"
         c = ch.json()
         base = {k: c[k] for k in ("id", "ts", "sig") if k in c}
         base["context"] = "login"
-        r = api_post(s, "/auth/captcha", dict(base, elapsed=random.randint(1800, 9000)))
-        d = r.json() if r.status_code == 200 else {}
+        tok = urllib.parse.unquote(s.cookies.get("XSRF-TOKEN", ""))
+        hdr = {"X-XSRF-TOKEN": tok} if tok else {}
+        r = s.post(f"{BASE_URL}/auth/captcha",
+                   json=dict(base, elapsed=random.randint(1800, 9000)),
+                   headers=hdr, timeout=30)
+        if r.status_code != 200:
+            return f"captcha POST HTTP {r.status_code}"
+        d = r.json()
+        if d.get("passed") and d.get("token"):
+            return "OK (captcha 直接通過)"
         opts = d.get("options") or []
         if not opts:
-            return "challenge 無卡片選項 (可能已直接通過)"
-        ir = api_get(s, f"/auth/captcha/image?t={urllib.parse.quote(opts[0])}")
+            return f"captcha 回應異常: {json.dumps(d, ensure_ascii=False)[:120]}"
+        ir = s.get(f"{BASE_URL}/auth/captcha/image?t={urllib.parse.quote(opts[0])}", timeout=30)
         if ir.status_code == 200 and len(ir.content) > 1000:
-            return "OK (圖服務正常)"
-        return f"面板側故障 HTTP {ir.status_code} (ACLClouds 自己嘅 /auth/captcha/image 掛咗, 非本端問題)"
+            return "OK (卡片圖正常)"
+        return (f"面板側故障 HTTP {ir.status_code}: /auth/captcha/image 唔出圖 "
+                f"(target={d.get('target')}), 登入頁卡片全空白 → 任何人(包括人手)都登入唔到")
     except Exception as e:
         return f"探測失敗: {e}"
 
