@@ -428,9 +428,9 @@ def renewal_availability(attrs, detail=None):
             reason = None
             if not can:
                 if free == 0:
-                    reason = "免费续期次数已用完"
+                    reason = "免費續期次數已用完"
                 else:
-                    reason = "面板标记暂不可续期 (can_renew=false)"
+                    reason = "面板標記暫不可續期（can_renew=false）"
             return can, free, reason
     return None, None, None
 
