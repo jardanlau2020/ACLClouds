@@ -66,6 +66,24 @@ RENEW_THRESHOLD_HOURS = float(os.environ.get("RENEW_THRESHOLD_HOURS", "48"))
 # 面板規則: 到期前 N 日先開續期窗口 (免費計劃頁面寫「Renewal will be available 2 days before expiration」)
 RENEW_WINDOW_DAYS = float(os.environ.get("RENEW_WINDOW_DAYS", "2"))
 
+
+def _parse_aliases(raw):
+    """ACL_SERVER_ALIASES: '面板名或id=顯示名, 另一台=名2' → {key_lower: 顯示名}"""
+    out = {}
+    for chunk in re.split(r"[,;\n]+", raw or ""):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        k, v = chunk.split("=", 1)
+        k, v = k.strip().lower(), v.strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
+# 面板伺服器名太長/太亂，可在此對映成 ACLClouds01 / ACLClouds02 (key 可用 server id 或面板名)
+SERVER_ALIASES = _parse_aliases(os.environ.get("ACL_SERVER_ALIASES", ""))
+
 # Cookie: 完整的浏览器 Cookie 字符串, 必须来自 https://aclclouds.com
 # 至少包含 XSRF-TOKEN 和 __Host-aclclouds_session
 COOKIE = os.environ.get("ACL_COOKIES", "").strip()
@@ -142,11 +160,11 @@ def now_cn_str():
 
 
 def fmt_dt_cn(dt):
-    """datetime → '10-03 22:51' (UTC+8)"""
+    """datetime → '10-03 22:51' (UTC+8, 省略年份)"""
     if not dt:
         return "?"
     try:
-        return (dt.astimezone(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+        return (dt.astimezone(timezone.utc) + timedelta(hours=8)).strftime("%m-%d %H:%M")
     except Exception:
         return "?"
 
@@ -1903,13 +1921,13 @@ def process_account(label, cookie_str):
         attrs = srv.get("attributes", srv) if isinstance(srv, dict) else {}
         sid = extract_server_id(attrs)
         name = attrs.get("name", f"server-{idx}")
-        row = {"name": name, "expire": None, "remaining": None, "can_renew": None,
+        row = {"name": name, "id": str(sid or ""), "expire": None, "remaining": None, "can_renew": None,
                "suspended": bool(attrs.get("is_suspended")), "status": attrs.get("status"),
-               "action": "", "note": ""}
+               "action": "", "note": "", "tag": "", "window_open": None}
         servers_info.append(row)
         if not sid:
             debug(f"{name}: 缺少 server id, attrs keys={list(attrs.keys()) if isinstance(attrs, dict) else '?'}")
-            row.update(action="warn", note="缺少 server id")
+            row.update(action="warn", note="缺少 server id", tag="⚠️ 冇 server id")
             skipped.append(f"⚠️ {name}: 缺少 server id")
             continue
 
@@ -1937,29 +1955,33 @@ def process_account(label, cookie_str):
                 break
         if auto_renew:
             log(f"  ⏭️ {name}: 面板已开启自动续期 (auto_renew=true), 无需脚本处理")
-            row.update(action="skip", note="面板已開自動續期")
+            row.update(action="skip", note="面板已開自動續期", tag="🔄 面板自動續")
             skipped.append(f"⏭️ {name}: auto_renew=true (面板自动续期)")
             continue
         if can_renew is False:
             log(f"  ⏭️ {name}: {reason or '不可续期'}")
-            row.update(action="skip", note=reason or "面板標記暫不可續期")
+            row.update(action="skip", note=reason or "面板標記暫不可續期", tag="⏳ 窗口未開")
+            if expire:
+                opens = expire - timedelta(days=RENEW_WINDOW_DAYS)
+                if opens > now:
+                    row["window_open"] = opens
             skipped.append(f"⏭️ {name}: {reason or '不可续期'}")
             continue
         if can_renew is True and free_left == 0:
             log(f"  ⏭️ {name}: 免费续期次数已用完 (free_renewals_remaining=0)")
-            row.update(action="skip", note="免費續期次數已用完")
+            row.update(action="skip", note="免費續期次數已用完", tag="🈳 免費次數用完")
             skipped.append(f"⏭️ {name}: 免费续期次数已用完")
             continue
 
         if not expire_str:
             log(f"  ⏭️ {name}: 无到期时间字段 (attrs keys 见 DEBUG=1)")
-            row.update(action="warn", note="無到期時間字段")
+            row.update(action="warn", note="無到期時間字段", tag="⚠️ 冇到期資料")
             skipped.append(f"⚠️ {name}: 无到期时间字段")
             continue
 
         if not expire:
             log(f"  ⏭️ {name}: 到期时间格式错误 ({expire_str})")
-            row.update(action="warn", note="到期時間格式錯誤")
+            row.update(action="warn", note="到期時間格式錯誤", tag="⚠️ 到期格式怪")
             skipped.append(f"⚠️ {name}: 到期时间格式错误")
             continue
 
@@ -1972,7 +1994,7 @@ def process_account(label, cookie_str):
             row.update(action="renew")
             to_renew.append({"id": sid, "name": name, "remaining": remaining, "row": row})
         else:
-            row.update(action="skip", note=f"未到續期閾值 {RENEW_THRESHOLD_HOURS:g}h")
+            row.update(action="skip", note=f"未到續期閾值 {RENEW_THRESHOLD_HOURS:g}h", tag="⏳ 未到窗口")
             skipped.append(f"⏭️ {name}: 剩 {fmt_remaining(remaining)}, 未到阈值 {RENEW_THRESHOLD_HOURS:g}h")
 
     if not to_renew:
@@ -1998,12 +2020,12 @@ def process_account(label, cookie_str):
                 # 大概率是 id 类型不对 (完整 uuid 而非短标识)
                 log(f"❌ HTTP 404: 服务器 id 可能不是短标识 ({srv['id']})")
                 results.append(f"❌ {srv['name']}: 404 (id 格式问题)")
-                row.update(action="failed", note="伺服器 id 格式問題 (404)")
+                row.update(action="failed", note="id 格式問題 404", tag="❌ 續期失敗")
                 failed += 1
             elif r.status_code == 401:
                 log(f"❌ HTTP 401: 会话失效, 本次不再继续")
                 results.append(f"❌ {srv['name']}: 401 会话失效")
-                row.update(action="failed", note="會話失效 (401)")
+                row.update(action="failed", note="會話失效 401", tag="❌ 續期失敗")
                 failed += 1
                 break
             elif r.status_code == 403 and captcha:
@@ -2013,13 +2035,13 @@ def process_account(label, cookie_str):
                     results.append(f"✅ {srv['name']}: API 被 Turnstile 拦截, 浏览器 fallback 续期成功 "
                                    f"({fmt_remaining(srv['remaining'])} → {fmt_remaining(new_rem)})")
                     log(f"✅ {srv['name']}: 浏览器 fallback 续期成功")
-                    row.update(action="renewed", note="瀏覽器 fallback 續期成功",
+                    row.update(action="renewed", note="瀏覽器 fallback", tag="✅ 已續期",
                                remaining=new_rem, expire=now + timedelta(seconds=new_rem))
                     renewed += 1
                 else:
                     results.append(f"❌ {srv['name']}: 被 Turnstile 拦截, 浏览器 fallback 亦失败")
                     log(f"❌ {srv['name']}: 浏览器 fallback 失败")
-                    row.update(action="failed", note="被驗證牆攔截, 瀏覽器 fallback 亦失敗")
+                    row.update(action="failed", note="驗證牆 + 瀏覽器 fallback 都失敗", tag="❌ 續期失敗")
                     failed += 1
             elif r.status_code in (200, 201, 202, 204):
                 # 2xx 也可能 body 带错误 (如 renewNotAvailableYet)
@@ -2028,7 +2050,7 @@ def process_account(label, cookie_str):
                     log(f"⏭️ 后端拒绝: {err}")
                     results.append(f"⏭️ {srv['name']}: {err}")
                     # 未真正续期, 但也不算失败
-                    row.update(action="skip", note=f"後端拒絕: {err}")
+                    row.update(action="skip", note=f"後端拒絕: {err}", tag="⏭️ 後端拒絕")
                 else:
                     time.sleep(1.5)
                     new_detail = server_detail(session, srv["id"])
@@ -2040,30 +2062,30 @@ def process_account(label, cookie_str):
                         if new_expire <= old_expire:
                             results.append(f"❌ {srv['name']}: 返回 2xx 但 expires_at 没有增加")
                             log(f"❌ 续期未确认: expires_at 未增加 ({new_expire.isoformat()})")
-                            row.update(action="failed", note="回 2xx 但到期時間冇後移")
+                            row.update(action="failed", note="回 2xx 但到期時間冇後移", tag="❌ 續期失敗")
                             failed += 1
                         else:
                             new_remaining = (new_expire - now).total_seconds()
                             results.append(f"✅ {srv['name']}: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
                             log(f"✅ 续期成功: {fmt_remaining(srv['remaining'])} → {fmt_remaining(new_remaining)}")
-                            row.update(action="renewed", note="續期成功",
+                            row.update(action="renewed", note="", tag="✅ 已續期",
                                        remaining=new_remaining, expire=new_expire)
                             renewed += 1
                     else:
                         results.append(f"❌ {srv['name']}: 2xx 但无法读取续期后的 expires_at")
                         log("❌ 续期未确认: 2xx 但详情无 expires_at")
-                        row.update(action="failed", note="2xx 但讀唔到新到期時間")
+                        row.update(action="failed", note="2xx 但讀唔到新到期時間", tag="❌ 續期失敗")
                         failed += 1
             else:
                 body = r.text[:200]
                 err = renew_error_msg(r)
                 results.append(f"❌ {srv['name']}: HTTP {r.status_code} {err or body}")
-                row.update(action="failed", note=f"HTTP {r.status_code} {err or ''}".strip())
+                row.update(action="failed", note=f"HTTP {r.status_code} {err or ''}".strip(), tag="❌ 續期失敗")
                 failed += 1
                 log(f"❌ 续期失败: HTTP {r.status_code} {err or body}")
         except Exception as e:
             results.append(f"❌ {srv['name']}: {e}")
-            row.update(action="failed", note=f"異常: {e}")
+            row.update(action="failed", note=f"異常: {e}", tag="❌ 續期失敗")
             failed += 1
             log(f"❌ 异常: {e}")
 
@@ -2102,39 +2124,38 @@ def collect_accounts():
     return accounts
 
 
-def _server_block(row):
-    """單台伺服器詳情區塊 (純文本排版)"""
-    out = [f"   🖥 {row.get('name', '?')}"]
-    if row.get("suspended"):
-        out.append("      ├ 狀態：🔴 已停權")
-    elif row.get("status"):
-        out.append("      ├ 狀態：" + str(row["status"]))
-    if row.get("expire"):
-        out.append("      ├ 到期：{}（當地）· 剩 {}".format(
-            fmt_dt_cn(row["expire"]), fmt_remaining_cn(row.get("remaining"))))
+def _server_alias(row):
+    """顯示名: 先查別名表 (server id 或面板名), 冇就用面板名"""
+    keys = [str(row.get("id") or "").lower(), str(row.get("name") or "").lower()]
+    for k in keys:
+        if k and k in SERVER_ALIASES:
+            return SERVER_ALIASES[k]
+    return row.get("name") or "?"
 
-    action = row.get("action")
+
+def _server_line(row, account=None):
+    """一台伺服器一行: ▪️ 顯示名 · 狀態 · 剩 X（Y 到期）"""
+    name = _server_alias(row)
+    if account:
+        name = f"{account}/{name}"
+    bits = ["▪️ " + name]
+    tag = row.get("tag") or ""
     note = row.get("note") or ""
-    if action == "renewed":
-        out.append(f"      └ 續期：✅ 成功" + (f"（{note}）" if note else ""))
-    elif action == "failed":
-        out.append(f"      └ 續期：❌ 失敗" + (f"（{note}）" if note else ""))
+    if row.get("action") == "failed":
+        bits.append(f"{tag}（{note}）" if note else (tag or "❌ 失敗"))
     else:
-        win = ""
-        exp = row.get("expire")
-        if exp and action == "skip":
-            try:
-                opens = exp - timedelta(days=RENEW_WINDOW_DAYS)
-                if opens > datetime.now(timezone.utc):
-                    win = "，窗口約 {} 開".format(fmt_dt_cn(opens))
-            except Exception:
-                win = ""
-        out.append(f"      └ 本輪：⏭️ 跳過（{note or '無需處理'}{win}）")
-    return "\n".join(out)
+        status = tag or "⏭️ 跳過"
+        if row.get("window_open"):
+            status += "（{} 開）".format(fmt_dt_cn(row["window_open"]))
+        bits.append(status)
+    if row.get("expire"):
+        bits.append("剩 {}（{} 到期）".format(
+            fmt_remaining_cn(row.get("remaining")), fmt_dt_cn(row["expire"])))
+    return " · ".join(bits)
 
 
 def build_summary(all_results):
-    """构建 TG 汇总消息 (純文本, 睇得清嘅排版)"""
+    """TG 匯總: 一行統計 + 每台一行, 只留重要資訊"""
     renewed_total = sum(r.get("renewed", 0) for r in all_results)
     failed_total = sum(r.get("failed", 0) for r in all_results)
     bad_accounts = sum(1 for r in all_results if not r.get("ok"))
@@ -2144,34 +2165,22 @@ def build_summary(all_results):
             if row.get("action") in ("skip", "warn"):
                 skipped_total += 1
 
-    sep = "━━━━━━━━━━━━━━━"
-    lines = [
-        "🎮 ACLClouds 續期巡檢",
-        f"🗓 {now_str()} ｜ 當地 {now_cn_str()}",
-        sep,
-        f"📊 續期成功 {renewed_total} ｜ 跳過 {skipped_total} ｜ 失敗 {failed_total}"
-        + (f" ｜ 帳號異常 {bad_accounts}" if bad_accounts else ""),
-        sep,
-    ]
+    lines = ["🎮 ACLClouds 續期 ｜ {} ｜ ✅ {} ｜ ⏭️ {} ｜ ❌ {}".format(
+        fmt_dt_cn(datetime.now(timezone.utc)), renewed_total, skipped_total, failed_total)]
+    if bad_accounts:
+        lines[0] += " ｜ ⚠️ 帳號異常 {}".format(bad_accounts)
 
+    multi = len(all_results) > 1
     for r in all_results:
-        head = "❌" if not r.get("ok") else "👤"
-        lines.append(f"{head} 帳號 {r['label']}：{r.get('msg', '')}")
-        if r.get("servers"):
-            for row in r["servers"]:
-                lines.append(_server_block(row))
-        elif r.get("results"):
-            for res in r["results"]:
-                lines.append(f"   · {res}")
-        lines.append("")
+        if not r.get("servers"):
+            lines.append("{} {} · {}".format(
+                "❌" if not r.get("ok") else "👤", r["label"], r.get("msg", "")))
+            continue
+        for row in r["servers"]:
+            lines.append(_server_line(row, account=r["label"] if multi else None))
 
     if failed_total or bad_accounts:
-        lines.append("⚠️ 有失敗項：睇返 workflow log 排查；窗口已開仍失敗就要人手登入面板續期")
-    elif renewed_total:
-        lines.append("✅ 自動續期完成，無需人手介入")
-    else:
-        lines.append("💤 無需處理，下一輪 cron 會再檢查")
-
+        lines.append("⚠️ 睇 workflow log；窗口已開都續唔到就要人手登入面板續期")
     return "\n".join(lines)
 
 

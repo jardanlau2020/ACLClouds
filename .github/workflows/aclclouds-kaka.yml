@@ -70,6 +70,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 面板名太長/太亂 → 顯示名對映, 格式 '面板名或id=顯示名' 逗號分隔
+          ACL_SERVER_ALIASES: ${{ secrets.ACL_SERVER_ALIASES }}
         # xvfb-run 提供虚拟显示器, uc_gui_click_captcha 的 GUI 点击才能工作
         run: |
           # IS_PROXY/PROXY_SERVER 由 setup_proxy.sh 經 GITHUB_ENV 注入 (未配橋則直連)
