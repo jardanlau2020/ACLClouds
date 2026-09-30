@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""探針 v2：ACLClouds「純 API 登入」可行性（帶自家卡片驗證的純 API 解卡）。
+"""探針 v3：ACLClouds 純 API 登入（校正 /auth/login 嘅正確欄位）。
 
-背景
-----
-2026-09-30 連續三單紅燈：cache cookie 過期 → 401 → 腳本退瀏覽器 fallback，
-但瀏覽器路徑睇唔到頁面上嘅 Cap 卡片挑戰（`_challenge_pending()` 只認
-"i am not a robot" / "Click on X"），表單冇 captcha_token 就交 → 頁面彈
-「Erreur / Captcha incorrect.」。
+v2 結果：卡片挑戰解得開、captcha_token 到手（ctx=login），但
+`POST /auth/login {captcha_token,email,password,remember}` 回 422 "Captcha incorrect."。
 
-但主腳本其實已經有**純 API 解卡**能力（`solve_captcha_api`，09-16 逆向，
-用於 context=renewal_gate）。本探針驗證同一套邏輯搬去 context=login 能唔能夠
-換到 captcha_token 並完成 `POST /auth/login`。
+由前端 bundle `6893.js` 反編譯出真正嘅請求（註冊/登入共用）：
 
-只做登入 + 讀 /api/client，**唔做任何續期動作**。
+    axios.get("/sanctum/csrf-cookie")
+      .then(() => axios.post("/auth/login", {
+          user:            username,
+          password:        password,
+          remember:        remember,
+          captcha_token:   captchaToken,   // /auth/captcha 過關後嗰個 token
+          captcha_answer:  captchaAnswer,  // 揀咗嗰張卡嘅 option token
+      }))
+
+⇒ v2 缺 `captcha_answer`、又用咗 `email` 而唔係 `user`，所以被當「Captcha incorrect」。
+本探針逐個變體試，全部重新解卡（token 每次新鮮）。
+
+只做登入 + 讀 /api/client，唔做任何續期動作。
 """
+import hashlib
 import json
 import os
 import random
@@ -41,7 +48,6 @@ def xsrf():
     return urllib.parse.unquote(s.cookies.get("XSRF-TOKEN", ""))
 
 
-# ── OCR 引擎（同 renew_fixed.py 一樣：ddddocr）──────────────────────────────
 _ocr_engine = None
 try:
     import ddddocr
@@ -60,103 +66,101 @@ def ocr(png_bytes):
         return ""
 
 
-def show(tag, r, n=260):
-    body = (r.text or "").replace("\n", " ")
-    print(f"  [{tag}] HTTP {r.status_code} {body[:n]}")
+def show(tag, r, n=300):
+    print(f"  [{tag}] HTTP {r.status_code} {(r.text or '').replace(chr(10),' ')[:n]}")
 
 
-print("== 1) csrf-cookie")
-show("sanctum", s.get(BASE + "/sanctum/csrf-cookie", timeout=25), 60)
-print("   cookies:", list(s.cookies.keys()))
-
-print(f"== 2) challenge (context={CONTEXT})")
-r = s.get(BASE + f"/auth/captcha/challenge?context={CONTEXT}", timeout=25)
-show("challenge", r)
-if r.status_code != 200:
-    sys.exit(1)
-c = r.json()
-base = {"context": c.get("context") or CONTEXT,
-        "id": c.get("id"), "ts": c.get("ts"), "sig": c.get("sig")}
-print(f"   id={str(base['id'])[:16]}... ts={base['ts']} sig={str(base['sig'])[:16]}...")
-
-token = None
-for rnd in range(1, MAX_ROUNDS + 1):
-    print(f"== 3.{rnd}) POST /auth/captcha (round {rnd})")
-    r = s.post(BASE + "/auth/captcha",
-               json=dict(base, elapsed=random.randint(1800, 9000)),
-               headers={"X-XSRF-TOKEN": xsrf()}, timeout=30)
-    show("captcha", r)
+def solve_captcha(context=CONTEXT):
+    """解卡 → (token, chosen_answer) 或 (None, None)。協議同 renew_fixed.py v2 一致。"""
+    s.get(BASE + "/sanctum/csrf-cookie", timeout=25)
+    r = s.get(BASE + f"/auth/captcha/challenge?context={context}", timeout=25)
     if r.status_code != 200:
-        break
-    a = r.json()
-    if a.get("passed") and a.get("token"):
-        token = a["token"]
-        print(f"   ✅ 第 {rnd} 輪直接通過, captcha_token len={len(token)}")
-        break
-    opts = a.get("options") or []
-    if not (a.get("interactive") and opts):
-        print(f"   ⚠️ 非互動且未通過: {json.dumps(a, ensure_ascii=False)[:200]}")
-        break
-    # 跟刷新後嘅 id/ts/sig（09-16 鐵律：用舊 id 交答案會被靜默拒）
-    if a.get("id") and a.get("sig"):
-        base = {"context": a.get("context") or base.get("context"),
-                "id": a["id"], "ts": a.get("ts") or base.get("ts"), "sig": a["sig"]}
-    target = (a.get("target") or "").strip()
-    asig = a.get("answer_sig") or ""
-    print(f"   🎯 目標 '{target}' / {len(opts)} 張卡 (answer_sig len={len(asig)})")
-    best, texts = None, []
-    for i, op in enumerate(opts):
-        ir = s.get(BASE + "/auth/captcha/image?t=" + urllib.parse.quote(op), timeout=25)
-        txt = ocr(ir.content) if ir.status_code == 200 else ""
-        texts.append(txt)
-        print(f"      卡{i}: HTTP {ir.status_code} {len(ir.content)}B OCR='{txt}'")
-        lo = txt.lower()
-        tl = target.lower()
-        if tl and (tl in lo or (lo and lo in tl)):
-            best = op
-            break
-    if best is None:
-        print(f"   ❌ OCR 冇一張中目標 (讀到: {texts}) → 唔盲交")
-        break
-    r2 = s.post(BASE + "/auth/captcha",
-                json=dict(base, answer=best, answer_sig=asig, target=target),
-                headers={"X-XSRF-TOKEN": xsrf()}, timeout=30)
-    show("answer", r2)
-    b = {}
-    try:
-        b = r2.json()
-    except Exception:  # noqa: BLE001
-        pass
-    if b.get("passed") and b.get("token"):
-        token = b["token"]
-        print(f"   ✅ 第 {rnd} 輪卡片過關, captcha_token len={len(token)}")
-        break
-    if b.get("id") and b.get("sig"):
-        base = {"context": b.get("context") or base.get("context"),
-                "id": b["id"], "ts": b.get("ts") or base.get("ts"), "sig": b["sig"]}
-    if not b.get("interactive"):
-        print(f"   ⚠️ 卡片後仍未過: {json.dumps(b, ensure_ascii=False)[:200]}")
-        break
+        print(f"   challenge HTTP {r.status_code}")
+        return None, None
+    c = r.json()
+    base = {"context": c.get("context") or context, "id": c.get("id"),
+            "ts": c.get("ts"), "sig": c.get("sig")}
+    for rnd in range(1, MAX_ROUNDS + 1):
+        r = s.post(BASE + "/auth/captcha", json=dict(base, elapsed=random.randint(1800, 9000)),
+                   headers={"X-XSRF-TOKEN": xsrf()}, timeout=30)
+        if r.status_code != 200:
+            print(f"   回合{rnd} HTTP {r.status_code}")
+            return None, None
+        a = r.json()
+        if a.get("passed") and a.get("token"):
+            print(f"   回合{rnd}: ✅ 直接過")
+            return a["token"], None
+        opts = a.get("options") or []
+        if not (a.get("interactive") and opts):
+            print(f"   回合{rnd}: 非互動未過 {json.dumps(a, ensure_ascii=False)[:160]}")
+            return None, None
+        if a.get("id") and a.get("sig"):
+            base = {"context": a.get("context") or base.get("context"), "id": a["id"],
+                    "ts": a.get("ts") or base.get("ts"), "sig": a["sig"]}
+        target = (a.get("target") or "").strip()
+        asig = a.get("answer_sig") or ""
+        best = None
+        for i, op in enumerate(opts):
+            ir = s.get(BASE + "/auth/captcha/image?t=" + urllib.parse.quote(op), timeout=25)
+            txt = ocr(ir.content) if ir.status_code == 200 else ""
+            print(f"      卡{i}: OCR='{txt}'")
+            lo, tl = txt.lower(), target.lower()
+            if tl and (tl in lo or (lo and lo in tl)):
+                best = op
+                break
+        if best is None:
+            print(f"   回合{rnd}: OCR 冇中 '{target}' → 唔盲交")
+            return None, None
+        r2 = s.post(BASE + "/auth/captcha", json=dict(base, answer=best, answer_sig=asig, target=target),
+                    headers={"X-XSRF-TOKEN": xsrf()}, timeout=30)
+        b = {}
+        try:
+            b = r2.json()
+        except Exception:  # noqa: BLE001
+            pass
+        if b.get("passed") and b.get("token"):
+            print(f"   回合{rnd}: ✅ 卡片過關 (目標 '{target}')")
+            return b["token"], best
+        if b.get("id") and b.get("sig"):
+            base = {"context": b.get("context") or base.get("context"), "id": b["id"],
+                    "ts": b.get("ts") or base.get("ts"), "sig": b["sig"]}
+        if not b.get("interactive"):
+            print(f"   回合{rnd}: 卡片後未過 {json.dumps(b, ensure_ascii=False)[:160]}")
+            return None, None
+    return None, None
 
-if not token:
-    print("== 結論: ❌ 攞唔到 captcha_token, 純 API 登入此路不通")
-    sys.exit(0)
 
-print("== 4) POST /auth/login (真憑證 + captcha_token)")
-for payload in ({"captcha_token": token, "email": EMAIL, "password": PASSWORD, "remember": True},
-                {"captcha_token": token, "email": EMAIL, "password": PASSWORD}):
-    r = s.post(BASE + "/auth/login", json=payload, headers={"X-XSRF-TOKEN": xsrf()}, timeout=30)
-    show("login", r, 200)
+VARIANTS = [
+    ("V1 JS-exact", lambda tok, ans: {"user": EMAIL, "password": PASSWORD, "remember": True,
+                                      "captcha_token": tok, "captcha_answer": ans}),
+    ("V2 缺 captcha_answer", lambda tok, ans: {"user": EMAIL, "password": PASSWORD, "remember": True,
+                                               "captcha_token": tok}),
+    ("V3 用 email 鍵", lambda tok, ans: {"email": EMAIL, "password": PASSWORD, "remember": True,
+                                        "captcha_token": tok, "captcha_answer": ans}),
+]
+
+for name, build in VARIANTS:
+    print(f"════ 變體 {name} ════")
+    tok, ans = solve_captcha()
+    if not tok:
+        print("   ❌ 解卡失敗, 跳過")
+        continue
+    print(f"   token len={len(tok)} chosen_answer={'有' if ans else '無'}")
+    r = s.post(BASE + "/auth/login", json=build(tok, ans),
+               headers={"X-XSRF-TOKEN": xsrf()}, timeout=30)
+    show("login", r, 400)
     if r.status_code in (200, 204):
-        break
-print("   🍪 cookies:", list(s.cookies.keys()))
+        chk = s.get(BASE + "/api/client", timeout=25)
+        show("/api/client", chk, 160)
+        if chk.status_code == 200:
+            sess = s.cookies.get("__Host-aclclouds_session", "") or s.cookies.get("aclclouds_session", "")
+            print(f"   🎉 純 API 登入成功！session len={len(sess)} "
+                  f"sha256[0:8]={hashlib.sha256(sess.encode()).hexdigest()[:8]}")
+            print(f"   結論: 用變體「{name}」")
+            sys.exit(0)
+        print("   ⚠️ login 2xx 但 /api/client 未認, 睇上面回應")
+    if r.status_code == 422 and "aptcha" not in (r.text or ""):
+        print("   ⚠️ 422 但唔係 captcha 錯 → 可能係憑證/欄位問題")
 
-chk = s.get(BASE + "/api/client", timeout=25)
-show("/api/client", chk, 200)
-if chk.status_code == 200:
-    sess = s.cookies.get("__Host-aclclouds_session", "") or s.cookies.get("aclclouds_session", "")
-    print(f"   🎉 純 API 登入成功！session len={len(sess)} sha256[0:8]="
-          f"{__import__('hashlib').sha256(sess.encode()).hexdigest()[:8]}")
-else:
-    print("== 結論: ❌ captcha 過咗但登入未成功（睇上面 login 回應）")
+print("== 結論: ❌ 三個變體都未成功, 需再查前端 login 流程")
 sys.exit(0)
