@@ -220,6 +220,8 @@ def fmt_remaining_cn(seconds):
     """人話版剩餘時間: '3 天 18 小時' / '5 小時 12 分' / '42 分' (TG 訊息用)"""
     if seconds is None:
         return "?"
+    if isinstance(seconds, timedelta):
+        seconds = seconds.total_seconds()
     if seconds < 0:
         return "已過期"
     s = int(seconds)
@@ -2133,55 +2135,74 @@ def _server_alias(row):
     return row.get("name") or "?"
 
 
-def _server_line(row, account=None):
-    """一台伺服器一行: ▪️ 顯示名 · 狀態 · 剩 X（Y 到期）"""
+def _render_server_b(row, account=None):
+    """方案 B (極致精簡人話版): 每台兩行
+    平時/跳過:
+      🟢 顯示名 · 狀態良好（剩 3 天 4 小時）
+      ℹ️ 10-03 22:51 到期 · 續期窗口將於 10-01 22:51 開啟
+    成功:
+      ✅ 顯示名 · 成功續期至 10-10
+      ℹ️ 剩餘 7 天 · 服務已自動展期
+    失敗:
+      🚨 顯示名 · 續期未完成（剩 X 小時）
+      ⚠️ 原因 · 請登入面板手動處理
+    """
     name = _server_alias(row)
     if account:
         name = f"{account}/{name}"
-    bits = ["▪️ " + name]
-    tag = row.get("tag") or ""
+    action = row.get("action")
+    exp = row.get("expire")
+    rem = row.get("remaining")
     note = row.get("note") or ""
-    if row.get("action") == "failed":
-        bits.append(f"{tag}（{note}）" if note else (tag or "❌ 失敗"))
-    else:
-        status = tag or "⏭️ 跳過"
-        if row.get("window_open"):
-            status += "（{} 開）".format(fmt_dt_cn(row["window_open"]))
-        bits.append(status)
-    if row.get("expire"):
-        bits.append("剩 {}（{} 到期）".format(
-            fmt_remaining_cn(row.get("remaining")), fmt_dt_cn(row["expire"])))
-    return " · ".join(bits)
+
+    if action == "renewed":
+        l1 = f"✅ {name} · 成功續期" + (f"至 {fmt_dt_cn(exp)}" if exp else "")
+        l2 = "ℹ️ " + (f"剩餘 {fmt_remaining_cn(rem)} · " if rem else "") + "服務已自動展期"
+        return [l1, l2]
+
+    if action == "failed":
+        rem_str = f"（剩 {fmt_remaining_cn(rem)}）" if rem else ""
+        l1 = f"🚨 {name} · 續期未完成{rem_str}"
+        reason = note or row.get("tag") or "驗證或提交異常"
+        l2 = f"⚠️ {reason} · 請登入面板手動處理"
+        return [l1, l2]
+
+    # 跳過 / 正常等候窗口 (skip / warn)
+    rem_str = f"（剩 {fmt_remaining_cn(rem)}）" if rem else ""
+    l1 = f"🟢 {name} · 狀態良好{rem_str}"
+    info_parts = []
+    if exp:
+        info_parts.append(f"{fmt_dt_cn(exp)} 到期")
+    if row.get("window_open"):
+        info_parts.append(f"續期窗口將於 {fmt_dt_cn(row['window_open'])} 開啟")
+    elif note:
+        info_parts.append(note)
+    l2 = "ℹ️ " + (" · ".join(info_parts) if info_parts else "未到續期窗口")
+    return [l1, l2]
 
 
 def build_summary(all_results):
-    """TG 匯總: 一行統計 + 每台一行, 只留重要資訊"""
-    renewed_total = sum(r.get("renewed", 0) for r in all_results)
-    failed_total = sum(r.get("failed", 0) for r in all_results)
-    bad_accounts = sum(1 for r in all_results if not r.get("ok"))
-    skipped_total = 0
-    for r in all_results:
-        for row in (r.get("servers") or []):
-            if row.get("action") in ("skip", "warn"):
-                skipped_total += 1
-
-    lines = ["🎮 ACLClouds 續期 ｜ {} ｜ ✅ {} ｜ ⏭️ {} ｜ ❌ {}".format(
-        fmt_dt_cn(datetime.now(timezone.utc)), renewed_total, skipped_total, failed_total)]
-    if bad_accounts:
-        lines[0] += " ｜ ⚠️ 帳號異常 {}".format(bad_accounts)
-
+    """TG 匯總: 方案 B 極致精簡人話版（消滅頂部計數器，每台兩行）"""
+    blocks = []
     multi = len(all_results) > 1
-    for r in all_results:
-        if not r.get("servers"):
-            lines.append("{} {} · {}".format(
-                "❌" if not r.get("ok") else "👤", r["label"], r.get("msg", "")))
-            continue
-        for row in r["servers"]:
-            lines.append(_server_line(row, account=r["label"] if multi else None))
 
-    if failed_total or bad_accounts:
-        lines.append("⚠️ 睇 workflow log；窗口已開都續唔到就要人手登入面板續期")
-    return "\n".join(lines)
+    for r in all_results:
+        # 帳號級失敗（連伺服器清單都攞唔到）
+        if not r.get("ok") and not r.get("servers"):
+            blocks.append([
+                f"🚨 ACLClouds · 帳號異常（{r['label']}）",
+                f"⚠️ {r.get('msg') or 'Cookie 失效或登入失敗'} · 請檢查憑證"
+            ])
+            continue
+
+        for row in (r.get("servers") or []):
+            blocks.append(_render_server_b(row, account=r["label"] if multi else None))
+
+    # 用空行分隔多台伺服器，每台內部緊密兩行
+    if not blocks:
+        return "🟢 ACLClouds · 檢查完成（未發現伺服器實例）"
+
+    return "\n\n".join("\n".join(b) for b in blocks)
 
 
 def main():
