@@ -130,13 +130,17 @@ def solve_captcha(context=CONTEXT):
     return None, None
 
 
+# 2026-09-30 由 4736.js（login route chunk）實錘：
+#   React.createElement(y.A, {context: "login", onVerify: (e, t) => { i(e); u(t) }})
+#   → captchaToken = e = token；captchaAnswer = t = **"human"**（widget 呼 onVerify(token,"human")）
+#   ⇒ /auth/login 嘅 captcha_answer 係固定字串 "human"，唔係揀咗嗰張卡！
 VARIANTS = [
-    ("V1 JS-exact", lambda tok, ans: {"user": EMAIL, "password": PASSWORD, "remember": True,
-                                      "captcha_token": tok, "captcha_answer": ans}),
-    ("V2 缺 captcha_answer", lambda tok, ans: {"user": EMAIL, "password": PASSWORD, "remember": True,
-                                               "captcha_token": tok}),
-    ("V3 用 email 鍵", lambda tok, ans: {"email": EMAIL, "password": PASSWORD, "remember": True,
-                                        "captcha_token": tok, "captcha_answer": ans}),
+    ("V1 captcha_answer='human'", lambda tok, ans: {"user": EMAIL, "password": PASSWORD, "remember": True,
+                                                    "captcha_token": tok, "captcha_answer": "human"}),
+    ("V2 'human' 但用 email 鍵", lambda tok, ans: {"email": EMAIL, "password": PASSWORD, "remember": True,
+                                                  "captcha_token": tok, "captcha_answer": "human"}),
+    ("V3 'human' 無 remember", lambda tok, ans: {"user": EMAIL, "password": PASSWORD,
+                                                 "captcha_token": tok, "captcha_answer": "human"}),
 ]
 
 for name, build in VARIANTS:
