@@ -1,0 +1,43 @@
+name: ACLClouds02-API自動續期
+
+# 第二個 ACLClouds 帳號（jeffer1 / 伺服器「Mon bot」）續期。
+# 走 Client API Key（ptlc_）路線：零 Cookie、零 Captcha、零瀏覽器、零代理，
+# 所以唔受 Laravel session 過期同 Turnstile 影響，唔需要 2 小時密跑。
+on:
+  schedule:
+    # 續期窗口 = 到期前 2 日（面板免費計劃規則），窗口闊 2 日；
+    # 每 6 小時一次 → 窗口內約 8 次機會，足夠有餘。
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aclclouds02-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 檢出代碼
+        uses: actions/checkout@v7
+
+      - name: 配置 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安裝依賴（API 路線只需 requests）
+        run: pip install requests
+
+      - name: 執行續期（API Key 模式）
+        env:
+          ACL_API_KEYS: ${{ secrets.ACL_API_KEYS }}
+          ACL_SERVER_ALIASES: ${{ secrets.ACL_SERVER_ALIASES }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python acl_api_renew.py
