@@ -35,6 +35,9 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
+# 續期端點嘅自家 anti-bot 驗證（403 captcha_required → renewal_gate → 帶 token 重發）
+from acl_captcha import renew_with_captcha
+
 # ==================== 配置 ====================
 BASE_URL = os.environ.get("ACL_API_BASE_URL", "").strip().rstrip("/") \
     or os.environ.get("ACL_BASE_URL", "https://aclclouds.com").rstrip("/")
@@ -118,6 +121,8 @@ SERVER_ALIASES = _parse_aliases(os.environ.get("ACL_SERVER_ALIASES", ""))
 
 
 def _alias(row):
+    """顯示名。別名對映缺項就淨係用面板名，唔好再被 account 前綴疊成
+    『ACLClouds02/ACLClouds02』—— 疊名睇唔出係邊台機出事。"""
     for k in (str(row.get("id") or "").lower(), str(row.get("name") or "").lower()):
         if k and k in SERVER_ALIASES:
             return SERVER_ALIASES[k]
@@ -265,7 +270,7 @@ def process_account(label, api_key):
             continue
 
         try:
-            r = renew_server(session, srv["id"])
+            r, captcha_req = renew_with_captcha(session, BASE_URL, srv["id"])
         except Exception as e:
             row["action"] = "failed"
             row["note"] = f"請求異常（{e}）"
@@ -291,6 +296,14 @@ def process_account(label, api_key):
 
         # 失敗分類
         body = r.text[:300]
+        if r.status_code == 403 and ("captcha_required" in body or
+                                      (captcha_req and "captcha" in body.lower())):
+            # 站方要 proof-of-human 而我哋過唔到。呢個唔係 key 死、唔係 CF 擋，
+            # 措辭要講清楚，唔好再誤導成「API Key 被拒」叫用戶去換 key。
+            row["action"] = "failed"
+            row["note"] = "站方要求真人驗證（captcha），自動解驗證未過，需人手續期"
+            res["servers"].append(row)
+            continue
         if r.status_code == 400 and "renewal_not_available" in body:
             days = ""
             try:

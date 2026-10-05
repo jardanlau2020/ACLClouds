@@ -31,8 +31,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 安裝依賴（API 路線只需 requests）
-        run: pip install requests
+      - name: 安裝依賴
+        # ddddocr = 續期端點自家 anti-bot 驗證（403 captcha_required）嘅卡片 OCR
+        run: pip install requests ddddocr
 
       - name: 執行續期（API Key 模式）
         env:
