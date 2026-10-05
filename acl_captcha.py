@@ -251,6 +251,19 @@ def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=3):
     import time
     _log("🧩 續期接口要 anti-bot 驗證, 走純 API renewal_gate 流程（唔使瀏覽器）...")
 
+    # payload 變體（欄位名；實際值喺每輪 solve 完先填入）：
+    # run #14-#16 實測 {captcha_token} 三次都 403，但卡片答啱、token 攞到、
+    # 時序 1.1-1.6s（唔係時序/一次性問題）→ 係欄位唔啱。
+    # 前端 4736.js 係 onVerify(token, "human")，登入欄位亦係
+    # user + captcha_token + captcha_answer → renew 大概率要一齊帶 answer。
+    # 一次過試晒，唔逐個 dispatch 浪費時間。
+    variants = [
+        lambda t: {"captcha_token": t, "captcha_answer": "human"},
+        lambda t: {"captcha_token": t, "captcha_answer": "true"},
+        lambda t: {"captcha": t},
+        lambda t: {"captcha_token": t},
+    ]
+
     for attempt in range(1, max_attempts + 1):
         t0 = time.time()
         tok = solve_captcha_api(session, base_url, "renewal_gate", max_rounds)
@@ -258,14 +271,15 @@ def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=3):
             _log(f"   [renew] 第 {attempt} 輪：純 API 驗證未過")
             return r, True
 
-        r2 = _post(session, base_url, path, {"captcha_token": tok})
-        dt = time.time() - t0
-        _log(f"   [renew] 第 {attempt} 輪帶 token 重發（solve+提交共 {dt:.1f}s）"
-             f" -> HTTP {r2.status_code} | {r2.text[:140]}")
-
-        if r2.status_code not in (403,) or "captcha" not in (r2.text or "").lower():
-            return r2, True
-        _log(f"   [renew] 第 {attempt} 輪仍被攔（token 可能一次性），攞新 token 再試")
+        for v_i, build in enumerate(variants, 1):
+            payload = build(tok)
+            r2 = _post(session, base_url, path, payload)
+            dt = time.time() - t0
+            _log(f"   [renew] 第 {attempt} 輪·變體{v_i} {sorted(payload)}（{dt:.1f}s）"
+                 f" -> HTTP {r2.status_code} | {r2.text[:130]}")
+            if r2.status_code not in (403,) or "captcha" not in (r2.text or "").lower():
+                return r2, True
+        _log(f"   [renew] 第 {attempt} 輪 4 個變體全被攔，攞新 token 再試")
         r = r2
 
     return r, True
