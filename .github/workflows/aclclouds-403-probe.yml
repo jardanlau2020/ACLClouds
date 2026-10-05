@@ -1,0 +1,36 @@
+name: ACLClouds 403 取證（一次性）
+
+# 診斷用：2026-10-05 續期 POST 食 403，但同一 key 讀 /api/client 正常
+# → 認證層通、403 只喺 renew 端點。要分清係帳號權限 / CF 反自動化 / UA 層。
+#
+# 與續期 workflow 唔同：呢個【唔發 Telegram】，避免同真實紅燈混淆。
+# 結果只落 run log，由助手讀完即刪。
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aclclouds-403-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安裝依賴
+        run: pip install requests
+
+      - name: 🩺 執行 403 探針
+        env:
+          ACL_API_KEYS: ${{ secrets.ACL_API_KEYS }}
+          ACL_API_BASE_URL: "https://aclclouds.com"
+        run: python probe_403.py
