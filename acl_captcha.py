@@ -217,7 +217,7 @@ def solve_captcha_api(session, base_url, context="renewal_gate", max_rounds=6):
     return None
 
 
-def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=3):
+def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=1):
     """續期 POST，遇 403 captcha_required 就解驗證再帶 token 重發。
 
     回 (response, captcha_was_required)。captcha_was_required=True 代表
@@ -251,17 +251,17 @@ def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=3):
     import time
     _log("🧩 續期接口要 anti-bot 驗證, 走純 API renewal_gate 流程（唔使瀏覽器）...")
 
-    # payload 變體（欄位名；實際值喺每輪 solve 完先填入）：
-    # run #14-#16 實測 {captcha_token} 三次都 403，但卡片答啱、token 攞到、
-    # 時序 1.1-1.6s（唔係時序/一次性問題）→ 係欄位唔啱。
-    # 前端 4736.js 係 onVerify(token, "human")，登入欄位亦係
-    # user + captcha_token + captcha_answer → renew 大概率要一齊帶 answer。
-    # 一次過試晒，唔逐個 dispatch 浪費時間。
+    # payload 欄位：run #17 實測 4 個變體 × 3 輪 = 12 次全被 403，最後觸發
+    # HTTP 429。配對呢條路已排除：
+    #   ✗ token 一次性（3 輪各自攞新 token 都一樣拒）
+    #   ✗ 時序/變效窗（solve+提交全程 1.0-2.1s）
+    #   ✗ 欄位唔齊（captcha_answer / captcha 鍵 / 純 token 全試過）
+    # 結論：captcha protocol 本身行得通（CSRF 過、卡片答啱、token 派發），
+    # 但 renew 端點唔認 API-key 身份攞到嘅 token —— 站方嗰道閘綁嘅係
+    # 登入 session 身份。API Key 路線對「免費機續期」行唔通。
+    # 因此只試最可能嗰個變體一次，唔好再空轉（避免撞 429）。
     variants = [
         lambda t: {"captcha_token": t, "captcha_answer": "human"},
-        lambda t: {"captcha_token": t, "captcha_answer": "true"},
-        lambda t: {"captcha": t},
-        lambda t: {"captcha_token": t},
     ]
 
     for attempt in range(1, max_attempts + 1):
@@ -279,7 +279,10 @@ def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=3):
                  f" -> HTTP {r2.status_code} | {r2.text[:130]}")
             if r2.status_code not in (403,) or "captcha" not in (r2.text or "").lower():
                 return r2, True
-        _log(f"   [renew] 第 {attempt} 輪 4 個變體全被攔，攞新 token 再試")
-        r = r2
+        # 撞到 429 就即停，唔好加深 rate limit
+        if r2.status_code == 429:
+            _log("   [renew] 撞到 HTTP 429（rate limit）→ 即停，唔再試")
+            return r2, True
+        _log(f"   [renew] 第 {attempt} 輪仍被攔")
 
     return r, True

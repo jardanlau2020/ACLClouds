@@ -6,6 +6,8 @@ name: ACLClouds 403 取證（一次性）
 # 與續期 workflow 唔同：呢個【唔發 Telegram】，避免同真實紅燈混淆。
 # 結果只落 run log，由助手讀完即刪。
 on:
+  # 診斷已完成（run 37305141975 揭 captcha_required），改成 dispatch-only，
+  # 唔想探針自動跑。留喺度做日後同類 403 嘅取證工具。
   workflow_dispatch: {}
 
 permissions:

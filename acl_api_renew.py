@@ -300,8 +300,8 @@ def process_account(label, api_key):
                                       (captcha_req and "captcha" in body.lower())):
             # 站方要 proof-of-human 而我哋過唔到。呢個唔係 key 死、唔係 CF 擋，
             # 措辭要講清楚，唔好再誤導成「API Key 被拒」叫用戶去換 key。
-            row["action"] = "failed"
-            row["note"] = "站方要求真人驗證（captcha），自動解驗證未過，需人手續期"
+            row["action"] = "manual"
+            row["note"] = "站方要求真人驗證（captcha），API Key 身份過唔到，需人手續期"
             res["servers"].append(row)
             continue
         if r.status_code == 400 and "renewal_not_available" in body:
@@ -335,6 +335,14 @@ def _render_block(row, account=None):
         l1 = f"✅ {name} · 成功續期" + (f"至 {fmt_dt_cn(exp)}" if exp else "")
         l2 = "ℹ️ " + (f"剩餘 {fmt_remaining_cn(rem)} · " if rem else "") + "服務已自動展期"
         return [l1, l2]
+
+    if action == "manual":
+        # 唔標紅：呢個唔係故障，係站方刻意要真人。API Key 路線對免費機
+        # 續期行唔通（run #12-#17 實測，captcha token 攞到但 renew 唔認），
+        # 標紅只會令人以為要換 key／壞咗，反覆誤導。
+        rem_str = f"（剩 {fmt_remaining_cn(rem)}）" if rem else ""
+        return [f"🖐 {name} · 需人工續期{rem_str}",
+                "ℹ️ 站方要真人過 captcha，API Key 自動續期行唔通 · 請登入面板手動續"]
 
     if action == "failed":
         rem_str = f"（剩 {fmt_remaining_cn(rem)}）" if rem else ""
