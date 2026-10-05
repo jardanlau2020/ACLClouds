@@ -217,37 +217,55 @@ def solve_captcha_api(session, base_url, context="renewal_gate", max_rounds=6):
     return None
 
 
-def renew_with_captcha(session, base_url, sid, max_rounds=6):
+def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=3):
     """續期 POST，遇 403 captcha_required 就解驗證再帶 token 重發。
 
     回 (response, captcha_was_required)。captcha_was_required=True 代表
     站方要求 proof-of-human（無論最後通唔通），TG 措辭要反映呢點。
+
+    為咩要重試多輪（run #14 實測）：第一次帶 token 重發仍回 403。
+    token 好似一次性／短命 —— OCR 掃四張卡本身要數秒，token 到手到提交
+    之間已經過咗變效窗。所以每輪都「solve → 即刻發 renew」，被拒就攞
+    新 token 再試，並記錄每輪耗時作時序證據。
     """
     path = f"/api/client/servers/{sid}/upgrade/renew"
     r = _post(session, base_url, path)
 
     captcha_required = False
-    if r.status_code == 403:
-        body = r.text or ""
-        try:
-            j = r.json()
-            code = j.get("code") if isinstance(j, dict) else None
-            if code == "captcha_required" or "captcha" in body.lower():
-                captcha_required = True
-        except Exception:
-            if "captcha" in body.lower():
-                captcha_required = True
+    if r.status_code != 403:
+        return r, False
 
-        if captcha_required:
-            _log("🧩 續期接口要 anti-bot 驗證, 走純 API renewal_gate 流程（唔使瀏覽器）...")
-            tok = solve_captcha_api(session, base_url, "renewal_gate", max_rounds)
-            if tok:
-                r2 = _post(session, base_url, path, {"captcha_token": tok})
-                _log(f"   [renew] 帶 token 重發 -> HTTP {r2.status_code} | {r2.text[:120]}")
-                if r2.status_code != 403 or "captcha" not in (r2.text or "").lower():
-                    return r2, captcha_required
-                _log("   [renew] 帶 token 仍被攔")
-            else:
-                _log("   [renew] 純 API 驗證未過")
+    body = r.text or ""
+    try:
+        j = r.json()
+        code = j.get("code") if isinstance(j, dict) else None
+        if code == "captcha_required" or "captcha" in body.lower():
+            captcha_required = True
+    except Exception:
+        if "captcha" in body.lower():
+            captcha_required = True
 
-    return r, captcha_required
+    if not captcha_required:
+        return r, False
+
+    import time
+    _log("🧩 續期接口要 anti-bot 驗證, 走純 API renewal_gate 流程（唔使瀏覽器）...")
+
+    for attempt in range(1, max_attempts + 1):
+        t0 = time.time()
+        tok = solve_captcha_api(session, base_url, "renewal_gate", max_rounds)
+        if not tok:
+            _log(f"   [renew] 第 {attempt} 輪：純 API 驗證未過")
+            return r, True
+
+        r2 = _post(session, base_url, path, {"captcha_token": tok})
+        dt = time.time() - t0
+        _log(f"   [renew] 第 {attempt} 輪帶 token 重發（solve+提交共 {dt:.1f}s）"
+             f" -> HTTP {r2.status_code} | {r2.text[:140]}")
+
+        if r2.status_code not in (403,) or "captcha" not in (r2.text or "").lower():
+            return r2, True
+        _log(f"   [renew] 第 {attempt} 輪仍被攔（token 可能一次性），攞新 token 再試")
+        r = r2
+
+    return r, True
