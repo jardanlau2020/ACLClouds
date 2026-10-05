@@ -67,8 +67,52 @@ def _get(session, base_url, path):
     return session.get(base_url + path, timeout=30)
 
 
+def _xsrf_token(session):
+    """從 cookie jar 攞 XSRF-TOKEN 並解 URL 編碼。
+
+    為咗需要：captcha endpoint 同 renew 都係 Laravel Sanctum 的 state-changing
+    POST，後端會查 CSRF token。純 API Key 路線冇 session cookie，所以開局
+    根本冇 XSRF-TOKEN → POST /auth/captcha 會 419 "CSRF token mismatch"
+    （2026-10-05 run #12 實測）。要先 GET 一個頁面叫站方發 XSRF-TOKEN cookie，
+    再把解碼後的值塞入 X-XSRF-TOKEN header。
+    """
+    try:
+        for c in session.cookies:
+            if c.name == "XSRF-TOKEN":
+                return urllib.parse.unquote(c.value)
+    except Exception:
+        pass
+    return None
+
+
+def _bootstrap_csrf(session, base_url):
+    """確保 cookie jar 有 XSRF-TOKEN；冇就 GET 首頁叫站方發一份。"""
+    if _xsrf_token(session):
+        return True
+    for path in ("/", "/login"):
+        try:
+            session.get(base_url + path, timeout=30)
+        except Exception as e:
+            _log(f"   [csrf] bootstrap GET {path} 異常: {e}")
+            continue
+        if _xsrf_token(session):
+            _log("   [csrf] 已由站方取得 XSRF-TOKEN")
+            return True
+    return False
+
+
 def _post(session, base_url, path, payload=None):
-    return session.post(base_url + path, json=payload if payload is not None else {}, timeout=30)
+    """POST 統一喺呢度注入 X-XSRF-TOKEN（冇 token 就唔加，令後端回 419 而唔係
+    靜默當成 CSRF 通過）。"""
+    headers = {}
+    tok = _xsrf_token(session)
+    if tok:
+        headers["X-XSRF-TOKEN"] = tok
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        headers.setdefault("Referer", base_url + "/")
+    return session.post(base_url + path,
+                        json=payload if payload is not None else {},
+                        headers=headers or None, timeout=30)
 
 
 def solve_captcha_api(session, base_url, context="renewal_gate", max_rounds=6):
@@ -76,6 +120,10 @@ def solve_captcha_api(session, base_url, context="renewal_gate", max_rounds=6):
 
     機房 IP 亦可用 —— 驗證係應用層 protocol，唔係互動 CAPTCHA 繞過。
     """
+    # 先攞 CSRF token：captcha endpoint 係 Sanctum POST，冇 X-XSRF-TOKEN 會 419
+    if not _bootstrap_csrf(session, base_url):
+        _log("   [csrf] 攞唔到 XSRF-TOKEN，captcha endpoint 大概率會 419")
+
     try:
         ch = _get(session, base_url, f"/auth/captcha/challenge?context={context}")
     except Exception as e:
