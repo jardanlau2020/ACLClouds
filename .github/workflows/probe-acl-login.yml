@@ -1,0 +1,41 @@
+name: ACL純API登入探針（只讀·唔續期）
+
+# 方案①前置驗證（2026-10-05 用戶批「做 ①」）：
+#   純 API 登入 → GET /api/client 驗 session —— 只讀，零續期、零寫操作。
+#   Cap PoW（cap_core/）+ form-urlencoded + sanctum XSRF + captcha_token。
+#   續期係寫操作，另候用戶拍板 A（一次做到尾）／B（只驗登入）先接。
+#
+# 只人手 dispatch；冇 schedule；刻意唔入 gha_keeper 監控清單（探針唔係保活排程）。
+# 結果判讀：run 綠 = 登入+session 驗證通過；run 紅 = 登入路線死（睇 log 尾）。
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acl-login-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 檢出代碼
+        uses: actions/checkout@v7
+
+      - name: 配置 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: 安裝依賴
+        run: pip install requests
+
+      - name: 登入探針（真帳密 · 只登入 · 唔續期）
+        env:
+          ACL_EMAIL: ${{ secrets.ACL_EMAIL }}
+          ACL_PASSWORD: ${{ secrets.ACL_PASSWORD }}
+        run: python probe_acl_login.py
