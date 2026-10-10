@@ -28,12 +28,69 @@ key 冇死、UA 換邊款都一樣 403 → 唔係 Cloudflare 擋，係站方應�
 本檔案係既有程式碼嘅搬移，唔係新寫 solver。
 """
 
+import json
 import os
 import random
 import re
+import subprocess
+import tempfile
 import urllib.parse
 
 import requests
+
+# ── Cap（tiagozip/cap 自架 PoW）—— 2026-10-10 定案：**續期閘要嘅係 Cap token** ──
+# 證據：① 瀏覽器流量診斷（lifecycle run 38013798276）撳 Renouveler 後前端彈
+#          「Confirmation anti-robot … Vérifier que vous êtes humain」+ Cap widget
+#       ② session cookie 路線帶**卡片 token** 重發 → 仍然 403 captcha_required
+#       ③ 改帶 **Cap token**（同一 session）→ HTTP 200「Serveur renouvelé avec succès」
+#          （lifecycle run 38014047160，到期 10-11 → 10-15）
+# 即係本檔原本解嘅 /auth/captcha 卡片題（renewal_gate）**唔係**續期要嘅 token。
+# 解算器唔係新寫：同 login 探針同一份 vendored cap_core/solve.mjs。
+CAP_SITEKEY = "235a82a3e3"
+CAP_API = f"https://cap.aclclouds.com/{CAP_SITEKEY}"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def solve_cap(session):
+    """Cap challenge → node PoW（cap_core/solve.mjs）→ redeem → 一次性 token。"""
+    try:
+        r = session.post(f"{CAP_API}/challenge", timeout=30)
+        r.raise_for_status()
+        chal = r.json()
+    except Exception as e:
+        _log(f"   [cap] challenge 異常: {e}")
+        return None
+    n_ch = len(chal.get("challenges") or [])
+    if not n_ch:
+        _log(f"   [cap] challenge 無 challenges: {str(chal)[:160]}")
+        return None
+    _log(f"   [cap] challenge 攞到 {n_ch} 條 PoW 題")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            inp, out = os.path.join(td, "c.json"), os.path.join(td, "s.json")
+            with open(inp, "w") as f:
+                json.dump(chal, f)
+            p = subprocess.run(["node", os.path.join(_HERE, "cap_core", "solve.mjs"),
+                                inp, out],
+                               capture_output=True, text=True, timeout=300, cwd=_HERE)
+            if p.returncode != 0:
+                _log(f"   [cap] solve.mjs rc={p.returncode}: "
+                     f"{(p.stderr or p.stdout)[-300:]}")
+                return None
+            with open(out) as f:
+                sol = json.load(f)
+        r2 = session.post(f"{CAP_API}/redeem",
+                          json={"token": sol["token"], "solutions": sol["solutions"]},
+                          headers={"Content-Type": "application/json"}, timeout=30)
+        j2 = r2.json()
+    except Exception as e:
+        _log(f"   [cap] PoW/redeem 異常: {e}")
+        return None
+    if not j2.get("success") or not j2.get("token"):
+        _log(f"   [cap] redeem fail: {str(j2)[:160]}")
+        return None
+    _log(f"   [cap] ✅ PoW 解完（{n_ch} 條），token len={len(str(j2['token']))}")
+    return str(j2["token"])
 
 # OCR 引擎（ddddocr 可選；缺咗就退化成「隨機揀卡博一輪」）
 OCR_AVAILABLE = False
@@ -263,6 +320,21 @@ def renew_with_captcha(session, base_url, sid, max_rounds=6, max_attempts=1):
     variants = [
         lambda t: {"captcha_token": t, "captcha_answer": "human"},
     ]
+
+    # 2026-10-10：先解 **Cap**（實證：呢個先係續期閘要嘅 token）
+    cap_tok = solve_cap(session)
+    if cap_tok:
+        r2 = _post(session, base_url, path, {"captcha_token": cap_tok})
+        _log(f"   [renew] Cap token（captcha_token）-> HTTP {r2.status_code}"
+             f" | {r2.text[:150]}")
+        if r2.status_code not in (403,) or "captcha" not in (r2.text or "").lower():
+            return r2, True
+        r2 = _post(session, base_url, path, {"token": cap_tok})
+        _log(f"   [renew] Cap token（token）-> HTTP {r2.status_code} | {r2.text[:150]}")
+        if r2.status_code not in (403,) or "captcha" not in (r2.text or "").lower():
+            return r2, True
+    else:
+        _log("   [renew] Cap 解唔到，轉用卡片題兜底")
 
     for attempt in range(1, max_attempts + 1):
         t0 = time.time()
