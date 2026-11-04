@@ -1235,6 +1235,38 @@ def captcha_image_health():
         return f"探測失敗: {e}"
 
 
+
+def _proxy_usable_for_browser(tcp_timeout=5, http_timeout=12):
+    """2026-11-04 移植自上游 weikkadd/ACLClouds-server 34dbfe9a：
+    「TCP 端口通」≠「代理能轉發」。
+
+    sing-box VLESS 節點斷線／被牆時，本地 127.0.0.1:1080 **仍然 listening**，
+    但任何請求都會失敗 → 瀏覽器一路 timeout，症狀好似「Turnstile 過唔到」，
+    實情係代理已經死。實測（OptiLink 同類事故）純 TCP 檢查會回報「健康」，
+    浪費整輪。
+    """
+    import socket, urllib.parse as _up
+    _pm = _up.urlsplit(PROXY_SERVER)
+    host = _pm.hostname or "127.0.0.1"
+    port = _pm.port or 1080
+    try:
+        sock = socket.create_connection((host, port), timeout=tcp_timeout)
+        sock.close()
+    except Exception as exc:
+        log(f"⚠️ 代理 {host}:{port} 不可達（{exc}）→ 回退直連")
+        return False
+    try:
+        resp = requests.get("https://aclclouds.com",
+                            proxies={"http": PROXY_SERVER, "https": PROXY_SERVER},
+                            timeout=http_timeout, allow_redirects=False)
+        log(f"🔗 代理 {host}:{port} 健康（轉發測試 HTTP {resp.status_code}）")
+        return True
+    except Exception as exc:
+        log(f"⚠️ 代理端口在聽但轉發失敗（{exc}）→ 回退直連")
+        log("   （NODE_LINK／sing-box 節點可能已失效，唔係 Turnstile 問題）")
+        return False
+
+
 def browser_login():
     """用浏览器登录 aclclouds.com, 返回 Cookie 字符串; 失败返回 None
 
@@ -1251,9 +1283,11 @@ def browser_login():
         return None
 
     kwargs = {"uc": True, "headless": HEADLESS}
-    if IS_PROXY:
+    if IS_PROXY and _proxy_usable_for_browser():
         log(f"🔗 浏览器走代理: {PROXY_SERVER}")
         kwargs["proxy"] = PROXY_SERVER
+    elif IS_PROXY:
+        log("🌐 代理不可用 → 浏览器改直连")
     else:
         log("🌐 浏览器直连 (Turnstile 过不去时请设 IS_PROXY=true + 干净代理)")
 
@@ -1368,9 +1402,11 @@ def renew_via_browser(srv, cookie_str, session, old_remaining):
         return None
 
     kwargs = {"uc": True, "headless": HEADLESS}
-    if IS_PROXY:
+    if IS_PROXY and _proxy_usable_for_browser():
         kwargs["proxy"] = PROXY_SERVER
         log(f"🔗 浏览器 fallback 走代理: {PROXY_SERVER}")
+    elif IS_PROXY:
+        log("🌐 代理不可用 → fallback 改直连")
 
     use_creds = bool(ACL_EMAIL and ACL_PASSWORD)
     log(f"🌐 浏览器 fallback: 启动 undetected-chrome ({'账密登录' if use_creds else 'cookie 注入'})")
